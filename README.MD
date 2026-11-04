@@ -43,3 +43,7 @@ Al finalizar este proyecto, el equipo deberá ser capaz de:
 
 * **Lenguaje:** Python
 * **Librerías principales:** OpenCV, TensorFlow / PyTorch, Scikit-learn, NumPy, Matplotlib/Seaborn.
+
+## Plan de accion
+
+Para desarrollar esta inteligencia artificial en Python, se recolectarán fotografías de naranjas desde una estación de captura inicial, las cuales serán redimensionadas y normalizadas entre 0 y 1 mediante librerías como OpenCV o TensorFlow. Luego, se aplicarán técnicas de aumento de datos (data augmentation) para simular variaciones de iluminación y evitar el sobreajuste, implementando una red neuronal convolucional (CNN) con modelos preentrenados que aseguren alta precisión. Finalmente, tras optimizar y evaluar el modelo dividiendo los datos en fases de prueba y entrenamiento. El despliegue de la IA aun esta en planificacion.
