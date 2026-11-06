@@ -19,31 +19,8 @@ weights/*
 dataset/*/*
 !dataset/*/.gitkeep
 
-# Logs y salidas de ejecucion
-*.log
-runs/
-runs_eval/
-.system_generated/
-# Entorno virtual y dependencias
-.venv/
-env/
-venv/
-ENV/
-
-# Python cache y compilados
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.pytest_cache/
-
-# Pesos y modelos grandes (salvo .gitkeep)
-weights/*
-!weights/.gitkeep
-
-# Dataset de imagenes locales (salvo .gitkeep de cada carpeta)
-dataset/*/*
-!dataset/*/.gitkeep
+# Previews temporales y graficos generados
+tests/*.png
 
 # Logs y salidas de ejecucion
 *.log

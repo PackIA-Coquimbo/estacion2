@@ -57,6 +57,7 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     device: torch.device,
+    max_batches: Optional[int] = None,
 ) -> Tuple[float, float]:
     """Ejecuta una época de entrenamiento con forward, backward y precisión mixta."""
     model.train()
@@ -66,7 +67,9 @@ def train_one_epoch(
 
     use_cuda = device.type == "cuda"
 
-    for images, targets in dataloader:
+    for batch_idx, (images, targets) in enumerate(dataloader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
         images = images.to(device, non_blocking=use_cuda)
         targets = targets.to(device, non_blocking=use_cuda)
 
@@ -96,6 +99,7 @@ def evaluate(
     dataloader: torch.utils.data.DataLoader,
     criterion: nn.Module,
     device: torch.device,
+    max_batches: Optional[int] = None,
 ) -> Tuple[float, float]:
     """Evalúa el modelo en el conjunto de validación o test."""
     model.eval()
@@ -105,7 +109,9 @@ def evaluate(
 
     use_cuda = device.type == "cuda"
 
-    for images, targets in dataloader:
+    for batch_idx, (images, targets) in enumerate(dataloader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
         images = images.to(device, non_blocking=use_cuda)
         targets = targets.to(device, non_blocking=use_cuda)
 
@@ -132,6 +138,7 @@ def train(
     weight_decay: float = 1e-2,
     patience: int = 7,
     seed: int = 42,
+    max_batches: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Pipeline completo de entrenamiento con checkpointing."""
     weights_dir.mkdir(parents=True, exist_ok=True)
@@ -150,24 +157,28 @@ def train(
         print("[DISPOSITIVO] Ejecucion en CPU/Grafica integrada.")
 
     # 2. Carga de Datos
-    print("\n[DATOS] Inicializando particiones de datos (Train/Val/Test)...")
-    dataloaders = create_dataloaders(
+    print("\n[DATOS] Inicializando particiones de datos estratificadas (Train/Val/Test)...")
+    dataloaders, class_weights = create_dataloaders(
         dataset_dir=dataset_dir,
         batch_size=batch_size,
         seed=seed,
         fallback_to_synthetic=True,
+        return_weights=True,
     )
     print(f"[DATOS] Conjunto de Entrenamiento: {len(dataloaders['train'].dataset)} muestras")
     print(f"[DATOS] Conjunto de Validacion:    {len(dataloaders['val'].dataset)} muestras")
     print(f"[DATOS] Conjunto de Evaluacion:    {len(dataloaders['test'].dataset)} muestras")
+    print(f"[DATOS] Pesos de ponderacion de clases calculados:")
+    for cls, w in zip(DEFAULT_CLASSES, class_weights.tolist()):
+        print(f"        - {cls:<20}: {w:.4f}")
 
     # 3. Inicialización del Modelo desde cero
     model = build_model(num_classes=len(DEFAULT_CLASSES)).to(device)
     total_params = model.count_parameters()["trainable"]
     print(f"\n[MODELO] Arquitectura: OrangeQualityCNN | Parametros entrenables: {total_params:,}")
 
-    # 4. Criterio, Optimizador y Precisión Mixta
-    criterion = nn.CrossEntropyLoss()
+    # 4. Criterio con compensación de desbalance, Optimizador y Precisión Mixta
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
     scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
@@ -195,10 +206,10 @@ def train(
         epoch_start = time.time()
 
         train_loss, train_acc = train_one_epoch(
-            model, dataloaders["train"], criterion, optimizer, scaler, device
+            model, dataloaders["train"], criterion, optimizer, scaler, device, max_batches=max_batches
         )
         val_loss, val_acc = evaluate(
-            model, dataloaders["val"], criterion, device
+            model, dataloaders["val"], criterion, device, max_batches=max_batches
         )
 
         current_lr = optimizer.param_groups[0]["lr"]
@@ -263,7 +274,7 @@ def train(
     if best_model_path.exists():
         checkpoint = torch.load(best_model_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
-        test_loss, test_acc = evaluate(model, dataloaders["test"], criterion, device)
+        test_loss, test_acc = evaluate(model, dataloaders["test"], criterion, device, max_batches=max_batches)
         print(f"[EVALUACION] Metricas en conjunto Test -> Loss: {test_loss:.4f} | Exactitud: {test_acc:.2f}%")
         history["test_loss"] = test_loss
         history["test_acc"] = test_acc
@@ -284,18 +295,25 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate inicial")
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="Regularización de pesos (L2)")
     parser.add_argument("--patience", type=int, default=7, help="Paciencia para early stopping")
+    parser.add_argument("--dry-run", action="store_true", help="Ejecuta una sola época de prueba rápida para validar el pipeline")
     parser.add_argument("--dataset-dir", type=str, default=str(PROJECT_ROOT / "dataset"), help="Ruta al dataset")
     parser.add_argument("--weights-dir", type=str, default=str(PROJECT_ROOT / "weights"), help="Ruta de pesos")
     args = parser.parse_args()
 
+    epochs = 1 if args.dry_run else args.epochs
+    max_batches = 5 if args.dry_run else None
+    if args.dry_run:
+        print("[AVISO] Modo Dry Run activado: ejecutando 1 época con 5 lotes de validación técnica.")
+
     train(
         dataset_dir=Path(args.dataset_dir),
         weights_dir=Path(args.weights_dir),
-        epochs=args.epochs,
+        epochs=epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
         patience=args.patience,
+        max_batches=max_batches,
     )
 
 

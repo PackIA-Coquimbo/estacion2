@@ -135,6 +135,25 @@ class OrangeDataset(Dataset):
             counts[class_name] += 1
         return counts
 
+    def get_class_weights(self) -> torch.Tensor:
+        """
+        Calcula pesos inversos por clase para mitigar el desbalance:
+        weight[c] = total_samples / (num_classes * count[c])
+        """
+        counts = self.get_class_counts()
+        total_samples = len(self.samples)
+        num_classes = len(self.class_names)
+        weights = []
+
+        for cls in self.class_names:
+            c = counts.get(cls, 0)
+            if c > 0:
+                weights.append(total_samples / (num_classes * c))
+            else:
+                weights.append(1.0)
+
+        return torch.tensor(weights, dtype=torch.float32)
+
 
 class SyntheticOrangeDataset(Dataset):
     """
@@ -182,6 +201,10 @@ class SyntheticOrangeDataset(Dataset):
             image = self.transform(image)
         return image, target
 
+    def get_class_weights(self) -> torch.Tensor:
+        """Pesos equitativos para el dataset sintético."""
+        return torch.ones(len(self.class_names), dtype=torch.float32)
+
 
 def create_dataloaders(
     dataset_dir: str | Path,
@@ -191,7 +214,8 @@ def create_dataloaders(
     num_workers: int = 0,
     seed: int = 42,
     fallback_to_synthetic: bool = True,
-) -> Dict[str, DataLoader]:
+    return_weights: bool = False,
+) -> Dict[str, DataLoader] | Tuple[Dict[str, DataLoader], torch.Tensor]:
     """
     Crea los DataLoaders para Entrenamiento, Validación y Test.
     Aplica Data Augmentation dinámicamente según el split.
@@ -211,18 +235,34 @@ def create_dataloaders(
     else:
         base_dataset = raw_dataset
 
-    total_samples = len(base_dataset)
-    train_size = int(total_samples * train_split)
-    val_size = int(total_samples * val_split)
-    test_size = total_samples - train_size - val_size
-
-    # Reproducibilidad de la división
+    # División Estratificada por Clase
     generator = torch.Generator().manual_seed(seed)
-    indices = torch.randperm(total_samples, generator=generator).tolist()
+    train_indices = []
+    val_indices = []
+    test_indices = []
 
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:train_size + val_size]
-    test_indices = indices[train_size + val_size:]
+    # Agrupar índices por clase
+    class_indices: Dict[int, List[int]] = {idx: [] for idx in range(len(base_dataset.class_names))}
+    for sample_idx, (_, class_idx) in enumerate(base_dataset.samples):
+        class_indices[class_idx].append(sample_idx)
+
+    for class_idx, idxs in class_indices.items():
+        # Mezclar índices de la clase
+        perm = torch.randperm(len(idxs), generator=generator).tolist()
+        shuffled_class_idxs = [idxs[i] for i in perm]
+
+        n_cls = len(shuffled_class_idxs)
+        n_train = int(n_cls * train_split)
+        n_val = int(n_cls * val_split)
+
+        train_indices.extend(shuffled_class_idxs[:n_train])
+        val_indices.extend(shuffled_class_idxs[n_train:n_train + n_val])
+        test_indices.extend(shuffled_class_idxs[n_train + n_val:])
+
+    # Mezclar los índices globales resultantes
+    train_indices = [train_indices[i] for i in torch.randperm(len(train_indices), generator=generator).tolist()]
+    val_indices = [val_indices[i] for i in torch.randperm(len(val_indices), generator=generator).tolist()]
+    test_indices = [test_indices[i] for i in torch.randperm(len(test_indices), generator=generator).tolist()]
 
     # Envolver con las transformaciones correspondientes
     train_tf = get_train_transforms()
@@ -273,6 +313,10 @@ def create_dataloaders(
             pin_memory=torch.cuda.is_available(),
         ),
     }
+
+    if return_weights:
+        class_weights = base_dataset.get_class_weights()
+        return dataloaders, class_weights
 
     return dataloaders
 
