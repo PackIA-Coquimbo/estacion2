@@ -1,0 +1,18 @@
+[Unit]
+Description=Estacion 2 - Analisis Visual de Calidad (OrangeQuality-AI)
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/estacion2
+ExecStart=/usr/bin/python3 src/station_listener.py --model weights/orange_model_int8.onnx
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+
