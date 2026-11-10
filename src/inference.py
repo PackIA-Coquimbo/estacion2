@@ -200,16 +200,23 @@ def export_to_onnx(
     dummy_input = torch.randn(1, 3, 224, 224, dtype=torch.float32)
 
     print(f"[ONNX Export] Exportando a: {onnx_output_path}...")
+    export_kwargs = {
+        "export_params": True,
+        "opset_version": 14,
+        "do_constant_folding": True,
+        "input_names": ["input_image"],
+        "output_names": ["logits"],
+        "dynamic_axes": {"input_image": {0: "batch_size"}, "logits": {0: "batch_size"}},
+    }
+    import inspect
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        export_kwargs["dynamo"] = False
+
     torch.onnx.export(
         model,
         dummy_input,
         str(onnx_output_path),
-        export_params=True,
-        opset_version=14,
-        do_constant_folding=True,
-        input_names=["input_image"],
-        output_names=["logits"],
-        dynamic_axes={"input_image": {0: "batch_size"}, "logits": {0: "batch_size"}},
+        **export_kwargs,
     )
 
     try:
