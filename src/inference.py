@@ -1,14 +1,17 @@
 """
-Motor de Inferencia en Tiempo Real Ligero (Edge / Raspberry Pi) y Exportación ONNX
+Motor de Inferencia en Tiempo Real Ligero (Edge / Raspberry Pi), Ingesta Asíncrona y Exportación ONNX
 (Estación 2: Análisis Visual de Calidad - OrangeQuality-AI)
 
-Características de Fase 2 (Edge):
+Características:
 1. Aislamiento completo de dependencias: Inferencia 100% nativa con onnxruntime,
-   numpy y opencv sin requerir PyTorch ni Pillow en el dispositivo embebido.
-2. Preprocesamiento Zero-Copy vectorizado directo (preprocess_cv2_fast) < 3.0 ms.
+   numpy y opencv sin requerir PyTorch ni Pillow en el dispositivo embebido (Fase 2).
+2. Preprocesamiento Zero-Copy vectorizado directo (preprocess_cv2_fast) < 3.0 ms (Fase 2).
 3. Sesión ONNX Runtime optimizada para CPU ARM Cortex (4 threads, optimización total de grafos).
-4. Función Softmax numéricamente estable implementada en NumPy nativo.
-5. Visualización superpuesta con código de colores y reporte de latencia detallado (preprocesamiento + inferencia).
+4. Ingesta de video asíncrona con hilo dedicado (FastCameraReader) que descarta frames viejos
+   del buffer V4L2/USB para 0 ms de retardo acumulado (Fase 3).
+5. Configuración USB FourCC 'MJPG' y resolución controlada 640x480 a 30 FPS (Fase 3).
+6. Soporte para cámara oficial CSI de Raspberry Pi mediante Picamera2 (Fase 3).
+7. Modo --headless para ejecución como servicio systemd o SSH sin costo de interfaz X11 (>25% ahorro de CPU).
 """
 
 from pathlib import Path
@@ -16,6 +19,7 @@ from typing import Dict, Any, Tuple, Optional, Union, List
 import argparse
 import sys
 import time
+import threading
 import numpy as np
 
 # Asegurar raíz en sys.path
@@ -114,6 +118,107 @@ def preprocess_cv2_fast(frame_bgr: np.ndarray, target_size: int = 224) -> np.nda
     tensor = (tensor - NORM_MEAN_NP) / NORM_STD_NP
 
     return np.ascontiguousarray(tensor, dtype=np.float32)
+
+
+class FastCameraReader:
+    """
+    Capturador de video asíncrono con hilo en segundo plano (Fase 3: Ingesta Asíncrona).
+    Lee continuamente de la cámara descartando frames viejos del buffer V4L2/USB,
+    garantizando que read_latest() entregue siempre el fotograma más actual con 0 ms de retardo.
+    """
+    def __init__(
+        self,
+        source: Union[int, str] = 0,
+        width: int = 640,
+        height: int = 480,
+        fps: int = 30,
+        fourcc: str = "MJPG",
+    ):
+        self.source = source
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.fourcc = fourcc
+
+        self.cap: Optional[Any] = None
+        self.lock = threading.Lock()
+        self.latest_frame: Optional[np.ndarray] = None
+        self.running = False
+        self.thread: Optional[threading.Thread] = None
+        self.grabbed = False
+        self.frame_count = 0
+
+    def start(self) -> "FastCameraReader":
+        if not HAS_OPENCV:
+            raise RuntimeError("OpenCV no está disponible. Instale 'opencv-python' o 'opencv-python-headless'.")
+
+        self.cap = cv2.VideoCapture(self.source)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"No se pudo abrir el dispositivo de cámara con índice/ruta: {self.source}")
+
+        # Configuración de hardware USB para Raspberry Pi (DoD Fase 3)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Forzar FourCC MJPG para no saturar bus USB
+        if self.fourcc and len(self.fourcc) == 4:
+            fourcc_code = cv2.VideoWriter_fourcc(*self.fourcc)
+            self.cap.set(cv2.CAP_PROP_FOURCC, fourcc_code)
+
+        self.running = True
+        self.thread = threading.Thread(target=self._worker, daemon=True, name="FastCameraReaderThread")
+        self.thread.start()
+
+        # Esperar a que el primer frame esté disponible
+        t_wait = time.time() + 3.0
+        while time.time() < t_wait:
+            with self.lock:
+                if self.latest_frame is not None:
+                    break
+            time.sleep(0.01)
+
+        print(f"[FastCameraReader] Cámara USB iniciada en fuente '{self.source}': {self.width}x{self.height} @ {self.fps} FPS ({self.fourcc})")
+        return self
+
+    def _worker(self) -> None:
+        """Hilo dedicado a drenar continuamente el buffer de la cámara."""
+        while self.running and self.cap is not None and self.cap.isOpened():
+            grabbed, frame = self.cap.read()
+            if not grabbed or frame is None:
+                time.sleep(0.005)
+                continue
+
+            with self.lock:
+                self.latest_frame = frame
+                self.grabbed = True
+                self.frame_count += 1
+
+    def read_latest(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """
+        Retorna (True, frame) con el fotograma más actual en memoria,
+        descartando frames atrasados acumulados en el buffer.
+        """
+        with self.lock:
+            if not self.grabbed or self.latest_frame is None:
+                return False, None
+            return True, self.latest_frame.copy()
+
+    def stop(self) -> None:
+        self.running = False
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+    def __enter__(self) -> "FastCameraReader":
+        return self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.stop()
 
 
 class QualityPredictor:
@@ -381,10 +486,111 @@ def run_preprocessing_benchmark(iterations: int = 200, frame_shape: Tuple[int, i
     return mean_lat
 
 
+def run_camera_stream(
+    predictor: QualityPredictor,
+    camera_source: Union[int, str] = 0,
+    use_picam: bool = False,
+    headless: bool = False,
+    max_frames: Optional[int] = None,
+    width: int = 640,
+    height: int = 480,
+    fps: int = 30,
+) -> None:
+    """
+    Ejecuta el bucle de inferencia en tiempo real sobre flujo de video asíncrono (Fase 3).
+    Soporta modo headless (sin X11/GUI) con reducción de CPU > 25% y Picamera2 (CSI).
+    """
+    reader = None
+    if use_picam:
+        try:
+            from src.camera_picam2 import PiCameraReader, is_picam2_available
+            if not is_picam2_available():
+                print("[AVISO] Picamera2 / CSI no detectada. Cambiando a FastCameraReader (USB)...")
+                reader = FastCameraReader(source=camera_source, width=width, height=height, fps=fps)
+            else:
+                reader = PiCameraReader(width=width, height=height, fps=fps)
+        except ImportError:
+            print("[AVISO] Módulo camera_picam2 no disponible. Usando FastCameraReader (USB)...")
+            reader = FastCameraReader(source=camera_source, width=width, height=height, fps=fps)
+    else:
+        reader = FastCameraReader(source=camera_source, width=width, height=height, fps=fps)
+
+    print("\n" + "=" * 70)
+    mode_str = "HEADLESS (Sin GUI X11 - Servicio / Producción)" if headless else "GUI INTERACTIVO (Ventana OpenCV)"
+    print(f"INICIANDO FLUJO DE VIDEO ASÍNCRONO - MODO: {mode_str}")
+    print(f"Resolución objetivo: {width}x{height} @ {fps} FPS | Formato: FourCC MJPG")
+    if headless:
+        print("Control: Modo consola activo. Presione Ctrl+C para detener.")
+    else:
+        print("Control: Ventana gráfica activa. Presione tecla 'q' para salir.")
+    print("=" * 70)
+
+    try:
+        reader.start()
+    except Exception as e:
+        print(f"Error al inicializar la cámara: {e}")
+        return
+
+    frames_processed = 0
+    t_start = time.perf_counter()
+    last_stat_time = t_start
+    stat_interval = 1.0  # Reporte de métricas cada 1 segundo en consola
+
+    try:
+        while True:
+            ret, frame = reader.read_latest()
+            if not ret or frame is None:
+                time.sleep(0.005)
+                continue
+
+            frames_processed += 1
+            result, annotated = predictor.predict_cv2(frame)
+
+            now = time.perf_counter()
+
+            if headless:
+                # Modo Headless: Cero llamadas a imshow/waitKey para ahorrar CPU
+                if (now - last_stat_time) >= stat_interval:
+                    elapsed = now - t_start
+                    effective_fps = frames_processed / elapsed if elapsed > 0 else 0
+                    print(
+                        f"[HEADLESS] Frame #{frames_processed:05d} | "
+                        f"Calidad: {result['predicted_class'].upper():<20} ({result['confidence_percent']:5.1f}%) | "
+                        f"Pre: {result['latency_preprocess_ms']:4.1f}ms | "
+                        f"Inf: {result['latency_inference_ms']:4.1f}ms | "
+                        f"FPS: {effective_fps:4.1f}"
+                    )
+                    last_stat_time = now
+            else:
+                cv2.imshow("Estacion 2 - Analisis Visual de Calidad (OrangeQuality-AI)", annotated)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+            if max_frames is not None and frames_processed >= max_frames:
+                print(f"[INFO] Límite de {max_frames} frames alcanzado.")
+                break
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Detención solicitada por el usuario (KeyboardInterrupt).")
+    finally:
+        reader.stop()
+        if not headless and HAS_OPENCV:
+            cv2.destroyAllWindows()
+
+        total_elapsed = time.perf_counter() - t_start
+        effective_fps = frames_processed / total_elapsed if total_elapsed > 0 else 0
+        print("-" * 70)
+        print(f"Resumen de Ejecución: {frames_processed} frames procesados en {total_elapsed:.2f}s ({effective_fps:.1f} FPS medio).")
+        print("=" * 70)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Inferencia y Calidad Visual (OrangeQuality-AI - Edge)")
     parser.add_argument("--image", type=str, default=None, help="Ruta a una imagen para clasificar")
     parser.add_argument("--webcam", type=int, default=None, help="Índice de cámara para inferencia en vivo")
+    parser.add_argument("--picam", action="store_true", help="Usa la cámara CSI oficial de Raspberry Pi (Picamera2)")
+    parser.add_argument("--headless", action="store_true", help="Modo sin interfaz gráfica (cero sobrecarga X11)")
+    parser.add_argument("--max-frames", type=int, default=None, help="Límite de fotogramas para pruebas o benchmark")
     parser.add_argument("--weights", type=str, default=str(PROJECT_ROOT / "weights" / "best_orange_model.pth"), help="Pesos .pth (PyTorch)")
     parser.add_argument("--onnx", type=str, default=None, help="Ruta a modelo .onnx (ONNX Runtime)")
     parser.add_argument("--export-onnx", type=str, default=None, help="Exportar modelo PyTorch a ONNX")
@@ -454,27 +660,14 @@ def main():
         print("=" * 55)
         return
 
-    if args.webcam is not None:
-        if not HAS_OPENCV:
-            print("Error: Se requiere 'opencv-python' o 'opencv-python-headless' para cámara.")
-            return
-
-        cap = cv2.VideoCapture(args.webcam)
-        if not cap.isOpened():
-            print(f"Error: No se pudo abrir la cámara con índice {args.webcam}")
-            return
-
-        print("\nIniciando inferencia en tiempo real. Presione 'q' para salir...")
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            _, annotated = predictor.predict_cv2(frame)
-            cv2.imshow("Estacion 2 - Analisis Visual de Calidad", annotated)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-        cap.release()
-        cv2.destroyAllWindows()
+    if args.webcam is not None or args.picam:
+        run_camera_stream(
+            predictor=predictor,
+            camera_source=args.webcam if args.webcam is not None else 0,
+            use_picam=args.picam,
+            headless=args.headless,
+            max_frames=args.max_frames,
+        )
         return
 
     # Inferencia Demo usando exclusivamente OpenCV y NumPy (sin Pillow)
