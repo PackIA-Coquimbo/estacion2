@@ -1,0 +1,6 @@
+# Dependencias ultraligeras para inferencia en Raspberry Pi (Estación 2 - Edge)
+# Elimina PyTorch, torchvision y Pillow para despliegue embebido
+onnxruntime>=1.15.0
+numpy>=1.24.0,<2.0.0
+opencv-python-headless>=4.8.0
+
