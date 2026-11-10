@@ -587,6 +587,7 @@ def run_camera_stream(
 def main():
     parser = argparse.ArgumentParser(description="Inferencia y Calidad Visual (OrangeQuality-AI - Edge)")
     parser.add_argument("--image", type=str, default=None, help="Ruta a una imagen para clasificar")
+    parser.add_argument("--json", action="store_true", help="Retorna la salida exclusivamente en formato JSON estándar")
     parser.add_argument("--webcam", type=int, default=None, help="Índice de cámara para inferencia en vivo")
     parser.add_argument("--picam", action="store_true", help="Usa la cámara CSI oficial de Raspberry Pi (Picamera2)")
     parser.add_argument("--headless", action="store_true", help="Modo sin interfaz gráfica (cero sobrecarga X11)")
@@ -645,6 +646,22 @@ def main():
             return
 
         res, _ = predictor.predict_cv2(frame)
+        if args.json:
+            import json
+            payload = {
+                "station_id": 2,
+                "timestamp": round(time.time(), 3),
+                "image_name": image_path.name,
+                "predicted_class": res["predicted_class"],
+                "confidence_percent": res["confidence_percent"],
+                "probabilities": res["probabilities"],
+                "latency_preprocess_ms": res["latency_preprocess_ms"],
+                "latency_inference_ms": res["latency_inference_ms"],
+                "latency_total_ms": res["latency_ms"],
+            }
+            print(json.dumps(payload, indent=2))
+            return
+
         print("\n" + "=" * 55)
         print("RESULTADO DE CLASIFICACIÓN DE CALIDAD VISUAL")
         print("=" * 55)
