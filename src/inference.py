@@ -635,6 +635,12 @@ def main():
     )
 
     if args.image:
+        if not HAS_OPENCV:
+            raise RuntimeError(
+                "OpenCV no está disponible. Instálalo con "
+                "'python -m pip install opencv-python' y vuelve a ejecutar."
+            )
+
         image_path = Path(args.image)
         if not image_path.exists():
             print(f"Error: No existe el archivo {image_path}")
@@ -688,6 +694,12 @@ def main():
         return
 
     # Inferencia Demo usando exclusivamente OpenCV y NumPy (sin Pillow)
+    if not HAS_OPENCV:
+        raise RuntimeError(
+            "OpenCV no está disponible. Instálalo con "
+            "'python -m pip install opencv-python' y vuelve a ejecutar."
+        )
+
     print("\n[Inferencia Demo] Generando frame sintético de prueba con OpenCV (Zero-Copy)...")
     demo_frame = np.full((480, 640, 3), (35, 35, 35), dtype=np.uint8)
     cv2.circle(demo_frame, (320, 240), 130, (20, 140, 235), -1)  # Naranja sintética

@@ -11,10 +11,6 @@ __pycache__/
 *.so
 .pytest_cache/
 
-# Pesos y modelos grandes (salvo .gitkeep)
-weights/*
-!weights/.gitkeep
-
 # Dataset de imagenes locales (salvo .gitkeep de cada carpeta)
 dataset/*/*
 !dataset/*/.gitkeep
