@@ -32,11 +32,13 @@ try:
 except ImportError:
     HAS_OPENCV = False
 
-from src.inference import (
-    QualityPredictor,
+from src.inf_erence.predictor import QualityPredictor
+from src.inf_erence.oranges import (
     EXPECTED_PHOTOS_PER_ORANGE,
     build_orange_payload,
+    format_orange_photo_name,
     group_photos_by_orange,
+    make_orange_id,
 )
 
 # Tiempo máximo (s) que se espera la(s) foto(s) faltante(s) de una naranja antes de
@@ -107,7 +109,7 @@ class StationCommunicator:
             success, encoded_img = cv2.imencode(".jpg", frame, encode_param)
             if not success:
                 raise RuntimeError("Fallo al codificar frame BGR a formato JPEG.")
-            final_path = self.inbox_dir / f"{uid}-{orange_number}.{photo_number}.jpg"
+            final_path = self.inbox_dir / format_orange_photo_name(uid, orange_number, photo_number)
             tmp_path = final_path.with_name(final_path.name + ".tmp")
             with open(tmp_path, "wb") as f:
                 f.write(encoded_img.tobytes())
@@ -327,7 +329,7 @@ class StationListener:
                     "timestamp": round(time.time(), 3),
                     "uid": uid,
                     "orange_number": orange_number,
-                    "orange_id": f"{uid}-{orange_number}",
+                    "orange_id": make_orange_id(uid, orange_number),
                     "error": "Ninguna foto de la naranja pudo decodificarse.",
                     "photos_count": 0,
                     "expected_photos": self.expected_photos,

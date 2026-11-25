@@ -12,563 +12,71 @@ Características:
 5. Configuración USB FourCC 'MJPG' y resolución controlada 640x480 a 30 FPS (Fase 3).
 6. Soporte para cámara oficial CSI de Raspberry Pi mediante Picamera2 (Fase 3).
 7. Modo --headless para ejecución como servicio systemd o SSH sin costo de interfaz X11 (>25% ahorro de CPU).
+
+Estructura de módulos (src/inf_erence/):
+- src/inf_erence/preprocessing.py  Preprocesamiento OpenCV/NumPy y softmax.
+- src/inf_erence/predictor.py      QualityPredictor (ONNX Runtime / PyTorch opcional).
+- src/inf_erence/oranges.py        Nombres de fotos, agrupación y promedio por naranja.
+- src/inf_erence/camera_usb.py     FastCameraReader (USB / V4L2).
+Otros: src/classes.py (clases), src/camera_picam2.py (CSI), tools/export_onnx.py (exportación ONNX).
+Este archivo contiene la CLI y reexporta los nombres anteriores por compatibilidad.
 """
 
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, Union, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import argparse
 import json
-import re
 import sys
 import time
-import threading
+
 import numpy as np
 
-# Asegurar raíz en sys.path
+# Asegurar raíz del proyecto en sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# OpenCV
-try:
-    import cv2
-    HAS_OPENCV = True
-except ImportError:
-    HAS_OPENCV = False
+# Reexportaciones por compatibilidad: `from src.inference import ...` sigue funcionando
+from src.classes import DEFAULT_CLASSES, CLASS_COLORS_BGR
+from src.inf_erence.preprocessing import (
+    HAS_OPENCV,
+    NORM_MEAN_NP,
+    NORM_STD_NP,
+    preprocess_cv2_fast,
+    softmax_numpy,
+)
+from src.inf_erence.camera_usb import FastCameraReader
+from src.inf_erence.predictor import QualityPredictor, HAS_ONNXRUNTIME, HAS_TORCH
+from src.inf_erence.oranges import (
+    EXPECTED_PHOTOS_PER_ORANGE,
+    IMAGE_EXTENSIONS,
+    ORANGE_PHOTO_PATTERN,
+    aggregate_probabilities,
+    build_orange_payload,
+    classify_oranges,
+    group_photos_by_orange,
+    parse_orange_photo_name,
+)
 
-# ONNX Runtime
-try:
-    import onnxruntime as ort
-    HAS_ONNXRUNTIME = True
-except ImportError:
-    HAS_ONNXRUNTIME = False
-
-# PyTorch (Opcional en Edge - requerido solo para entrenamiento y exportación)
-try:
-    import torch
-    import torch.nn.functional as F
-    from src.model import build_model, OrangeQualityCNN
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-    torch = None
-
-# Pillow (Opcional en Edge)
-try:
-    from PIL import Image
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
-
-# Clases por defecto del proyecto
-DEFAULT_CLASSES: List[str] = [
-    "buen_estado",
-    "marginalmente_buena",
-    "mal_estado",
+__all__ = [
+    "DEFAULT_CLASSES", "CLASS_COLORS_BGR",
+    "HAS_OPENCV", "HAS_ONNXRUNTIME", "HAS_TORCH",
+    "NORM_MEAN_NP", "NORM_STD_NP", "preprocess_cv2_fast", "softmax_numpy",
+    "FastCameraReader", "QualityPredictor", "export_to_onnx",
+    "EXPECTED_PHOTOS_PER_ORANGE", "IMAGE_EXTENSIONS", "ORANGE_PHOTO_PATTERN",
+    "aggregate_probabilities", "build_orange_payload", "classify_oranges",
+    "group_photos_by_orange", "parse_orange_photo_name",
+    "run_preprocessing_benchmark", "run_camera_stream", "print_orange_results", "main",
 ]
 
-# Normalización estándar (ImageNet) pre-vectorizada para NumPy (1, 3, 1, 1)
-NORM_MEAN_NP = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
-NORM_STD_NP = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+if HAS_OPENCV:
+    import cv2
 
-# Paleta de colores para visualización BGR (OpenCV)
-CLASS_COLORS_BGR = {
-    "buen_estado": (40, 200, 40),          # Verde
-    "marginalmente_buena": (0, 200, 240),  # Amarillo / Ámbar
-    "mal_estado": (40, 40, 220),           # Rojo
-}
 
-# Convención de nombres de las fotos que entrega la Estación 1 (varias fotos por naranja):
-#   <uid>-<n_naranja>.<n_foto>[.ext]   ej: 7712323-1.1.jpg, 7712323-1.2.jpg, 7712323-2.1.jpg
-ORANGE_PHOTO_PATTERN = re.compile(r"^(?P<uid>.+)-(?P<orange>\d+)\.(?P<photo>\d+)$")
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
-EXPECTED_PHOTOS_PER_ORANGE = 2
-
-
-def parse_orange_photo_name(path: Union[str, Path]) -> Optional[Tuple[str, int, int]]:
-    """
-    Extrae (uid, numero_naranja, numero_foto) del nombre de archivo.
-    Acepta nombres con o sin extensión de imagen: '7712323-1.2.jpg' o '7712323-1.2'.
-    Retorna None si el nombre no sigue la convención.
-    """
-    name = Path(path).name
-    if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
-        name = Path(name).stem
-    match = ORANGE_PHOTO_PATTERN.match(name)
-    if match is None:
-        return None
-    return match.group("uid"), int(match.group("orange")), int(match.group("photo"))
-
-
-def group_photos_by_orange(
-    paths: Sequence[Union[str, Path]],
-) -> Tuple[Dict[Tuple[str, int], List[Path]], List[Path]]:
-    """
-    Agrupa rutas de fotos por naranja (uid, numero_naranja), ordenadas por número de foto.
-    Retorna (grupos, rutas_que_no_siguen_la_convencion).
-    """
-    groups: Dict[Tuple[str, int], List[Tuple[int, Path]]] = {}
-    unmatched: List[Path] = []
-    for raw_path in paths:
-        path = Path(raw_path)
-        parsed = parse_orange_photo_name(path)
-        if parsed is None:
-            unmatched.append(path)
-            continue
-        uid, orange_number, photo_number = parsed
-        groups.setdefault((uid, orange_number), []).append((photo_number, path))
-
-    ordered = {
-        key: [path for _, path in sorted(items)]
-        for key, items in sorted(groups.items())
-    }
-    return ordered, unmatched
-
-
-def aggregate_probabilities(
-    probs_list: Sequence[np.ndarray],
-    class_names: Sequence[str],
-) -> Dict[str, Any]:
-    """
-    Promedia las probabilidades Softmax de varias fotos de una misma naranja
-    (soft voting) y entrega la clase final con su confianza promedio.
-    """
-    if len(probs_list) == 0:
-        raise ValueError("Se requiere al menos una distribución de probabilidades.")
-
-    stacked = np.stack([np.asarray(p, dtype=np.float64).reshape(-1) for p in probs_list])
-    if stacked.shape[1] != len(class_names):
-        raise ValueError(
-            f"Cada foto debe tener {len(class_names)} probabilidades; se recibieron {stacked.shape[1]}."
-        )
-
-    mean_probs = stacked.mean(axis=0)
-    best_idx = int(np.argmax(mean_probs))
-    best_conf = float(mean_probs[best_idx])
-    per_photo_classes = {int(i) for i in stacked.argmax(axis=1)}
-
-    return {
-        "predicted_class": class_names[best_idx],
-        "confidence": round(best_conf, 4),
-        "confidence_percent": round(best_conf * 100.0, 2),
-        "probabilities": {
-            name: round(float(prob), 4) for name, prob in zip(class_names, mean_probs)
-        },
-        "photos_agree": len(per_photo_classes) == 1,
-    }
-
-
-def softmax_numpy(logits: np.ndarray) -> np.ndarray:
-    """
-    Calcula la función Softmax de forma numéricamente estable usando exclusivamente NumPy.
-    Sustituye la dependencia de torch.nn.functional.softmax en la Raspberry Pi.
-    """
-    shifted_logits = logits - np.max(logits, axis=-1, keepdims=True)
-    exp_logits = np.exp(shifted_logits)
-    return exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
-
-
-def preprocess_cv2_fast(frame_bgr: np.ndarray, target_size: int = 224) -> np.ndarray:
-    """
-    Preprocesamiento vectorizado directo (Zero-Copy / Fast Path) desde OpenCV.
-    Elimina por completo la sobrecarga de conversión a PIL.Image y torchvision.transforms.
-
-    Operaciones:
-    1. cv2.resize: Redimensionamiento rápido con interpolación lineal a (target_size, target_size).
-    2. cv2.cvtColor: Conversión de espacio de color BGR a RGB.
-    3. Transposición matricial: Reordenamiento de dimensiones HWC a CHW.
-    4. Normalización matricial directa en float32: (img / 255.0 - mean) / std.
-
-    Retorna:
-        np.ndarray contiguo en memoria con forma (1, 3, target_size, target_size) y dtype float32.
-    """
-    if not HAS_OPENCV:
-        raise RuntimeError("OpenCV no está disponible. Instale 'opencv-python' o 'opencv-python-headless'.")
-
-    # 1. Resize rápido
-    resized = cv2.resize(frame_bgr, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
-
-    # 2. BGR -> RGB
-    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-
-    # 3. HWC a CHW y añadir dimensión de batch (1, C, H, W)
-    chw = np.transpose(rgb, (2, 0, 1))
-    tensor = np.expand_dims(chw, axis=0).astype(np.float32) / 255.0
-
-    # 4. Normalización matricial directa
-    tensor = (tensor - NORM_MEAN_NP) / NORM_STD_NP
-
-    return np.ascontiguousarray(tensor, dtype=np.float32)
-
-
-class FastCameraReader:
-    """
-    Capturador de video asíncrono con hilo en segundo plano (Fase 3: Ingesta Asíncrona).
-    Lee continuamente de la cámara descartando frames viejos del buffer V4L2/USB,
-    garantizando que read_latest() entregue siempre el fotograma más actual con 0 ms de retardo.
-    """
-    def __init__(
-        self,
-        source: Union[int, str] = 0,
-        width: int = 640,
-        height: int = 480,
-        fps: int = 30,
-        fourcc: str = "MJPG",
-    ):
-        self.source = source
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.fourcc = fourcc
-
-        self.cap: Optional[Any] = None
-        self.lock = threading.Lock()
-        self.latest_frame: Optional[np.ndarray] = None
-        self.running = False
-        self.thread: Optional[threading.Thread] = None
-        self.grabbed = False
-        self.frame_count = 0
-
-    def start(self) -> "FastCameraReader":
-        if not HAS_OPENCV:
-            raise RuntimeError("OpenCV no está disponible. Instale 'opencv-python' o 'opencv-python-headless'.")
-
-        self.cap = cv2.VideoCapture(self.source)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"No se pudo abrir el dispositivo de cámara con índice/ruta: {self.source}")
-
-        # Configuración de hardware USB para Raspberry Pi (DoD Fase 3)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        # Forzar FourCC MJPG para no saturar bus USB
-        if self.fourcc and len(self.fourcc) == 4:
-            fourcc_code = cv2.VideoWriter_fourcc(*self.fourcc)
-            self.cap.set(cv2.CAP_PROP_FOURCC, fourcc_code)
-
-        self.running = True
-        self.thread = threading.Thread(target=self._worker, daemon=True, name="FastCameraReaderThread")
-        self.thread.start()
-
-        # Esperar a que el primer frame esté disponible
-        t_wait = time.time() + 3.0
-        while time.time() < t_wait:
-            with self.lock:
-                if self.latest_frame is not None:
-                    break
-            time.sleep(0.01)
-
-        print(f"[FastCameraReader] Cámara USB iniciada en fuente '{self.source}': {self.width}x{self.height} @ {self.fps} FPS ({self.fourcc})")
-        return self
-
-    def _worker(self) -> None:
-        """Hilo dedicado a drenar continuamente el buffer de la cámara."""
-        while self.running and self.cap is not None and self.cap.isOpened():
-            grabbed, frame = self.cap.read()
-            if not grabbed or frame is None:
-                time.sleep(0.005)
-                continue
-
-            with self.lock:
-                self.latest_frame = frame
-                self.grabbed = True
-                self.frame_count += 1
-
-    def read_latest(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """
-        Retorna (True, frame) con el fotograma más actual en memoria,
-        descartando frames atrasados acumulados en el buffer.
-        """
-        with self.lock:
-            if not self.grabbed or self.latest_frame is None:
-                return False, None
-            return True, self.latest_frame.copy()
-
-    def stop(self) -> None:
-        self.running = False
-        if self.thread is not None and self.thread.is_alive():
-            self.thread.join(timeout=1.0)
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
-
-    def __enter__(self) -> "FastCameraReader":
-        return self.start()
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.stop()
-
-
-class QualityPredictor:
-    """
-    Motor de predicción optimizado para inferencia en CPU ARM (Raspberry Pi 4 / 5) y PC.
-    Soporta ONNX Runtime puro (sin dependencias pesadas) y PyTorch (.pth) opcional.
-    """
-    def __init__(
-        self,
-        model_path: Optional[Union[str, Path]] = None,
-        device: Optional[str] = None,
-        use_onnx: bool = True,
-        num_threads: int = 4,
-    ):
-        self.use_onnx = use_onnx
-        self.class_names = DEFAULT_CLASSES
-        self.num_threads = num_threads
-
-        if self.use_onnx:
-            self._load_onnx_session(model_path)
-        else:
-            if not HAS_TORCH:
-                raise ImportError(
-                    "PyTorch no está instalado en este entorno. "
-                    "Para inferencia en Edge/Raspberry Pi, use modelos ONNX con use_onnx=True."
-                )
-            self._load_pytorch_model(model_path, device=device)
-
-    def _load_onnx_session(self, model_path: Optional[Union[str, Path]]) -> None:
-        """Carga y configura una sesión de ONNX Runtime optimizada para CPU ARM."""
-        if not HAS_ONNXRUNTIME:
-            raise ImportError("onnxruntime no está instalado. Ejecute 'pip install onnxruntime'.")
-
-        if model_path is None:
-            default_int8 = PROJECT_ROOT / "weights" / "orange_model_int8.onnx"
-            default_fp32 = PROJECT_ROOT / "weights" / "orange_model.onnx"
-            if default_int8.exists():
-                model_path = default_int8
-            elif default_fp32.exists():
-                model_path = default_fp32
-            else:
-                raise FileNotFoundError(
-                    "No se encontró un modelo ONNX por defecto en weights/. "
-                    "Especifique la ruta con --onnx weights/<modelo>.onnx"
-                )
-
-        model_path = Path(model_path)
-        if not model_path.exists():
-            raise FileNotFoundError(f"Archivo ONNX no encontrado: {model_path}")
-
-        # Configuración de optimización de sesión en ONNX Runtime (Fase 2)
-        sess_options = ort.SessionOptions()
-        sess_options.intra_op_num_threads = self.num_threads
-        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-        providers = ["CPUExecutionProvider"]
-        if HAS_TORCH and torch is not None and torch.cuda.is_available():
-            providers.insert(0, "CUDAExecutionProvider")
-
-        self.session = ort.InferenceSession(
-            str(model_path),
-            sess_options=sess_options,
-            providers=providers,
-        )
-        self.input_name = self.session.get_inputs()[0].name
-        print(f"[QualityPredictor] Sesión ONNX cargada: {model_path.name}", file=sys.stderr)
-        print(f"[QualityPredictor] Hilos intra-op: {self.num_threads} | Proveedores: {self.session.get_providers()}", file=sys.stderr)
-
-    def _load_pytorch_model(self, model_path: Optional[Union[str, Path]], device: Optional[str] = None) -> None:
-        """Carga el modelo PyTorch tradicional (.pth)."""
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = torch.device(device)
-
-        self.model = build_model(num_classes=len(self.class_names))
-        if model_path is not None and Path(model_path).exists():
-            checkpoint = torch.load(model_path, map_location=self.device)
-            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-                self.model.load_state_dict(checkpoint["model_state_dict"])
-                self.class_names = checkpoint.get("class_names", self.class_names)
-            elif isinstance(checkpoint, dict):
-                self.model.load_state_dict(checkpoint)
-            print(f"[QualityPredictor] Modelo PyTorch cargado desde: {model_path}", file=sys.stderr)
-        else:
-            print("[QualityPredictor] Aviso: Sin archivo de pesos. Usando arquitectura no entrenada.", file=sys.stderr)
-        self.model.to(self.device)
-        self.model.eval()
-
-    def _infer_probs(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, float, float]:
-        """
-        Ejecuta preprocesamiento + inferencia de un frame BGR.
-        Retorna (probabilidades[num_classes], latencia_preproceso_ms, latencia_inferencia_ms).
-        """
-        # 1. Preprocesamiento Zero-Copy
-        t0 = time.perf_counter()
-        input_tensor = preprocess_cv2_fast(frame_bgr, target_size=224)
-        prep_latency_ms = (time.perf_counter() - t0) * 1000.0
-
-        # 2. Inferencia pura
-        t_inf_start = time.perf_counter()
-        if self.use_onnx:
-            raw_logits = self.session.run(None, {self.input_name: input_tensor})[0]
-            probs_arr = softmax_numpy(raw_logits)[0]
-        else:
-            with torch.no_grad():
-                torch_in = torch.from_numpy(input_tensor).to(self.device)
-                logits = self.model(torch_in)
-                probs_arr = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-        inf_latency_ms = (time.perf_counter() - t_inf_start) * 1000.0
-
-        return np.asarray(probs_arr, dtype=np.float32), prep_latency_ms, inf_latency_ms
-
-    def predict_orange(
-        self,
-        frames_bgr: Sequence[np.ndarray],
-        photo_names: Optional[Sequence[str]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Califica una naranja a partir de varias fotos (p. ej. 2 por naranja).
-        Promedia las probabilidades de todas las fotos y entrega la clase final
-        con su confianza promedio, junto al detalle de cada foto.
-        """
-        if len(frames_bgr) == 0:
-            raise ValueError("Se requiere al menos una foto por naranja.")
-        if photo_names is not None and len(photo_names) != len(frames_bgr):
-            raise ValueError("photo_names debe tener el mismo largo que frames_bgr.")
-
-        probs_list: List[np.ndarray] = []
-        photos: List[Dict[str, Any]] = []
-        prep_total_ms = 0.0
-        inf_total_ms = 0.0
-
-        for i, frame in enumerate(frames_bgr):
-            probs, prep_ms, inf_ms = self._infer_probs(frame)
-            probs_list.append(probs)
-            prep_total_ms += prep_ms
-            inf_total_ms += inf_ms
-
-            photo_result = aggregate_probabilities([probs], self.class_names)
-            photo_result.pop("photos_agree")
-            if photo_names is not None:
-                photo_result = {"image_name": photo_names[i], **photo_result}
-            photos.append(photo_result)
-
-        result = aggregate_probabilities(probs_list, self.class_names)
-        result.update({
-            "photos_count": len(frames_bgr),
-            "photos": photos,
-            "latency_preprocess_ms": round(prep_total_ms, 2),
-            "latency_inference_ms": round(inf_total_ms, 2),
-            "latency_ms": round(prep_total_ms + inf_total_ms, 2),
-        })
-        return result
-
-    def predict_cv2(self, frame_bgr: np.ndarray) -> Tuple[Dict[str, Any], np.ndarray]:
-        """
-        Inferencia de alto rendimiento Zero-Copy para frames OpenCV en BGR.
-        Mide por separado el tiempo de preprocesamiento y de inferencia pura.
-
-        Retorna:
-            (resultado_dict, frame_anotado)
-        """
-        probs_arr, prep_latency_ms, inf_latency_ms = self._infer_probs(frame_bgr)
-        total_latency_ms = prep_latency_ms + inf_latency_ms
-        best_idx = int(np.argmax(probs_arr))
-
-        best_class = self.class_names[best_idx]
-        best_conf = float(probs_arr[best_idx])
-
-        result = {
-            "predicted_class": best_class,
-            "confidence": round(best_conf, 4),
-            "confidence_percent": round(best_conf * 100.0, 2),
-            "probabilities": {
-                name: round(float(prob), 4) for name, prob in zip(self.class_names, probs_arr)
-            },
-            "latency_preprocess_ms": round(prep_latency_ms, 2),
-            "latency_inference_ms": round(inf_latency_ms, 2),
-            "latency_ms": round(total_latency_ms, 2),
-        }
-
-        # 3. Superposición visual (UI HUD)
-        annotated = frame_bgr.copy()
-        color = CLASS_COLORS_BGR.get(best_class, (200, 200, 200))
-        h, w = annotated.shape[:2]
-
-        # Barra superior informativa
-        cv2.rectangle(annotated, (0, 0), (w, 55), (20, 20, 20), -1)
-        cv2.rectangle(annotated, (0, 0), (12, 55), color, -1)
-
-        text_title = f"Calidad: {best_class.upper()} ({result['confidence_percent']}%)"
-        cv2.putText(annotated, text_title, (24, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA)
-
-        text_sub = (
-            f"Pre: {prep_latency_ms:.1f}ms | Inf: {inf_latency_ms:.1f}ms | "
-            f"Total: {total_latency_ms:.1f}ms | Estacion 2 (Edge)"
-        )
-        cv2.putText(annotated, text_sub, (24, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
-
-        return result, annotated
-
-    def predict_pil(self, image: Any) -> Dict[str, Any]:
-        """
-        Soporte de compatibilidad para objetos PIL.Image.
-        Convierte a BGR y deriva la llamada a predict_cv2 para consistencia total.
-        """
-        if not HAS_OPENCV:
-            raise RuntimeError("OpenCV es requerido para realizar la inferencia.")
-        rgb_arr = np.array(image.convert("RGB"))
-        bgr_frame = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
-        result, _ = self.predict_cv2(bgr_frame)
-        return result
-
-
-def export_to_onnx(
-    weights_path: Union[str, Path],
-    onnx_output_path: Union[str, Path],
-    num_classes: int = len(DEFAULT_CLASSES),
-    device: str = "cpu",
-) -> Path:
-    """Convierte el modelo de PyTorch (.pth) a formato ONNX optimizado."""
-    if not HAS_TORCH:
-        raise ImportError("Se requiere PyTorch para exportar modelos a ONNX.")
-
-    weights_path = Path(weights_path)
-    onnx_output_path = Path(onnx_output_path)
-    onnx_output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    print(f"[ONNX Export] Cargando modelo PyTorch desde: {weights_path}")
-    model = build_model(num_classes=num_classes)
-    if weights_path.exists():
-        ckpt = torch.load(weights_path, map_location=device)
-        model.load_state_dict(ckpt.get("model_state_dict", ckpt))
-    model.eval()
-
-    dummy_input = torch.randn(1, 3, 224, 224, dtype=torch.float32)
-
-    print(f"[ONNX Export] Exportando a: {onnx_output_path}...")
-    export_kwargs = {
-        "export_params": True,
-        "opset_version": 14,
-        "do_constant_folding": True,
-        "input_names": ["input_image"],
-        "output_names": ["logits"],
-        "dynamic_axes": {"input_image": {0: "batch_size"}, "logits": {0: "batch_size"}},
-    }
-    import inspect
-    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
-        export_kwargs["dynamo"] = False
-
-    torch.onnx.export(
-        model,
-        dummy_input,
-        str(onnx_output_path),
-        **export_kwargs,
-    )
-
-    try:
-        import onnx
-        onnx_model = onnx.load(str(onnx_output_path))
-        onnx.checker.check_model(onnx_model)
-        print("[ONNX Export] Validacion estructural exitosa con onnx.checker.")
-    except ImportError:
-        print("[ONNX Export] Aviso: onnx.checker omitido por falta del paquete onnx.")
-
-    print(f"[ONNX Export] Proceso completado: {onnx_output_path}")
-    return onnx_output_path
+def export_to_onnx(*args, **kwargs) -> Path:
+    """Compatibilidad: delega en tools/export_onnx.py (requiere PyTorch)."""
+    from tools.export_onnx import export_to_onnx as _export_to_onnx
+    return _export_to_onnx(*args, **kwargs)
 
 
 def run_preprocessing_benchmark(iterations: int = 200, frame_shape: Tuple[int, int, int] = (480, 640, 3)) -> float:
@@ -611,6 +119,7 @@ def run_preprocessing_benchmark(iterations: int = 200, frame_shape: Tuple[int, i
     status_str = "CUMPLIDO" if passed else "FALLIDO"
     print(f"[DoD Fase 2] Latencia preprocesamiento <= 3.5 ms: {status_str} ({mean_lat:.2f} ms)")
     return mean_lat
+
 
 
 def run_camera_stream(
@@ -711,81 +220,6 @@ def run_camera_stream(
         print("=" * 70)
 
 
-def classify_oranges(
-    predictor: QualityPredictor,
-    image_paths: Sequence[Union[str, Path]],
-    expected_photos: int = EXPECTED_PHOTOS_PER_ORANGE,
-) -> List[Dict[str, Any]]:
-    """
-    Agrupa las fotos por naranja según su nombre (<uid>-<naranja>.<foto>),
-    califica cada naranja promediando sus fotos y retorna un resultado por naranja.
-    Los avisos se emiten por stderr para no contaminar la salida JSON.
-    """
-    if not HAS_OPENCV:
-        raise RuntimeError("OpenCV es requerido para leer las imágenes.")
-
-    groups, unmatched = group_photos_by_orange(image_paths)
-    for path in unmatched:
-        print(
-            f"[AVISO] '{path.name}' no sigue el formato <uid>-<naranja>.<foto>; se omite.",
-            file=sys.stderr,
-        )
-
-    results: List[Dict[str, Any]] = []
-    for (uid, orange_number), paths in groups.items():
-        orange_id = f"{uid}-{orange_number}"
-        frames: List[np.ndarray] = []
-        names: List[str] = []
-        for path in paths:
-            frame = cv2.imread(str(path)) if path.exists() else None
-            if frame is None:
-                print(f"[AVISO] No se pudo leer la foto {path} (naranja {orange_id}).", file=sys.stderr)
-                continue
-            frames.append(frame)
-            names.append(path.name)
-
-        if not frames:
-            print(f"[AVISO] Naranja {orange_id} sin fotos válidas; no se califica.", file=sys.stderr)
-            continue
-        if len(frames) != expected_photos:
-            print(
-                f"[AVISO] Naranja {orange_id}: {len(frames)} foto(s) válidas, "
-                f"se esperaban {expected_photos}. Se promedian las disponibles.",
-                file=sys.stderr,
-            )
-
-        res = predictor.predict_orange(frames, photo_names=names)
-        results.append(build_orange_payload(uid, orange_number, res, expected_photos))
-
-    return results
-
-
-def build_orange_payload(
-    uid: str,
-    orange_number: int,
-    orange_result: Dict[str, Any],
-    expected_photos: int = EXPECTED_PHOTOS_PER_ORANGE,
-) -> Dict[str, Any]:
-    """Arma el JSON estandarizado de salida por naranja (CLI y servicio inter-estaciones)."""
-    return {
-        "station_id": 2,
-        "timestamp": round(time.time(), 3),
-        "uid": uid,
-        "orange_number": orange_number,
-        "orange_id": f"{uid}-{orange_number}",
-        "predicted_class": orange_result["predicted_class"],
-        "confidence_percent": orange_result["confidence_percent"],
-        "probabilities": orange_result["probabilities"],
-        "photos_count": orange_result["photos_count"],
-        "expected_photos": expected_photos,
-        "complete": orange_result["photos_count"] == expected_photos,
-        "photos_agree": orange_result["photos_agree"],
-        "photos": orange_result["photos"],
-        "latency_preprocess_ms": orange_result["latency_preprocess_ms"],
-        "latency_inference_ms": orange_result["latency_inference_ms"],
-        "latency_total_ms": orange_result["latency_ms"],
-    }
-
 
 def print_orange_results(results: Sequence[Dict[str, Any]]) -> None:
     """Imprime los resultados por naranja en formato legible."""
@@ -805,6 +239,7 @@ def print_orange_results(results: Sequence[Dict[str, Any]]) -> None:
             print(f"  - {photo['image_name']:<24}: {photo['predicted_class']} ({photo['confidence_percent']}%)")
         print(f"Latencia Total:          {res['latency_total_ms']} ms")
     print("=" * 55)
+
 
 
 def main():
@@ -975,6 +410,7 @@ def main():
     for cls, prob in res["probabilities"].items():
         print(f"  - {cls:<22}: {prob * 100:.2f}%")
     print("=" * 55)
+
 
 
 if __name__ == "__main__":

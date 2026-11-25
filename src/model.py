@@ -13,12 +13,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Clases por defecto del proyecto según la estructura de dataset/
-DEFAULT_CLASSES: List[str] = [
-    "buen_estado",
-    "marginalmente_buena",
-    "mal_estado",
-]
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Fuente única de las clases (reexportada aquí por compatibilidad)
+from src.classes import DEFAULT_CLASSES
 
 
 class ConvBlock(nn.Module):

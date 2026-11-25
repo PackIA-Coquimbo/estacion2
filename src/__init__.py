@@ -6,9 +6,6 @@ try:
     from src.model import OrangeQualityCNN, build_model, DEFAULT_CLASSES
     __all__ = ["OrangeQualityCNN", "build_model", "DEFAULT_CLASSES"]
 except ImportError:
-    DEFAULT_CLASSES = [
-        "buen_estado",
-        "marginalmente_buena",
-        "mal_estado",
-    ]
+    # Entorno Edge sin PyTorch
+    from src.classes import DEFAULT_CLASSES
     __all__ = ["DEFAULT_CLASSES"]

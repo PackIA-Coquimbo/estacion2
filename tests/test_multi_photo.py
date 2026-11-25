@@ -51,6 +51,16 @@ def test_parse_orange_photo_name(name, expected):
     assert parse_orange_photo_name(name) == expected
 
 
+@pytest.mark.parametrize("uid, orange, photo", [("7712323", 1, 1), ("7712323", 12, 2), ("lote-A-9", 3, 1)])
+def test_photo_name_format_and_pattern_agree(uid, orange, photo):
+    """Si se cambia el formato de nombres, escritura y lectura deben seguir coincidiendo."""
+    from src.inf_erence.oranges import format_orange_photo_name, make_orange_id
+
+    name = format_orange_photo_name(uid, orange, photo)
+    assert parse_orange_photo_name(name) == (uid, orange, photo)
+    assert make_orange_id(uid, orange) == f"{uid}-{orange}"
+
+
 def test_group_photos_by_orange_orders_and_separates():
     paths = ["7712323-2.2.jpg", "7712323-1.2.jpg", "otra.jpg", "7712323-1.1.jpg", "7712323-2.1.jpg"]
     groups, unmatched = group_photos_by_orange(paths)
