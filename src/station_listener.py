@@ -11,7 +11,7 @@ Características de Fase 4:
 """
 
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, Union
+from typing import Dict, Any, Tuple, Optional, Union, List, Sequence
 import argparse
 import json
 import os
@@ -32,7 +32,16 @@ try:
 except ImportError:
     HAS_OPENCV = False
 
-from src.inference import QualityPredictor
+from src.inference import (
+    QualityPredictor,
+    EXPECTED_PHOTOS_PER_ORANGE,
+    build_orange_payload,
+    group_photos_by_orange,
+)
+
+# Tiempo máximo (s) que se espera la(s) foto(s) faltante(s) de una naranja antes de
+# calificarla con las fotos disponibles.
+DEFAULT_PHOTO_TIMEOUT_SEC = 2.0
 
 
 def get_default_shm_dir() -> Path:
@@ -65,6 +74,107 @@ class StationCommunicator:
         self.trigger_path = self.shm_dir / "estacion_trigger.flag"
         self.result_path = self.shm_dir / "estacion2_result.json"
         self.ack_path = self.shm_dir / "estacion_ack.flag"
+
+        # Canal multi-foto por naranja:
+        #   inbox/   <- Estación 1 deja <uid>-<naranja>.<foto>.jpg (escritura atómica .tmp + rename)
+        #   results/ <- Estación 2 deja <uid>-<naranja>.json con la calificación promediada
+        self.inbox_dir = self.shm_dir / "estacion2_inbox"
+        self.results_dir = self.shm_dir / "estacion2_results"
+        self.inbox_dir.mkdir(parents=True, exist_ok=True)
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Canal multi-foto por naranja
+    # ------------------------------------------------------------------
+    def send_orange_photos_from_station1(
+        self,
+        uid: str,
+        orange_number: int,
+        frames_bgr: Sequence[np.ndarray],
+        quality: int = 95,
+    ) -> List[Path]:
+        """
+        Usado por la Estación 1 (o simulador): deja las fotos de una naranja en la bandeja
+        como <uid>-<naranja>.<n_foto>.jpg. Cada archivo se escribe primero como .tmp y luego
+        se renombra, por lo que la Estación 2 nunca lee una imagen a medio escribir.
+        """
+        if not HAS_OPENCV:
+            raise RuntimeError("OpenCV no está disponible para codificar la imagen.")
+
+        written: List[Path] = []
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        for photo_number, frame in enumerate(frames_bgr, start=1):
+            success, encoded_img = cv2.imencode(".jpg", frame, encode_param)
+            if not success:
+                raise RuntimeError("Fallo al codificar frame BGR a formato JPEG.")
+            final_path = self.inbox_dir / f"{uid}-{orange_number}.{photo_number}.jpg"
+            tmp_path = final_path.with_name(final_path.name + ".tmp")
+            with open(tmp_path, "wb") as f:
+                f.write(encoded_img.tobytes())
+            tmp_path.replace(final_path)
+            written.append(final_path)
+        return written
+
+    def list_pending_oranges(self) -> Dict[Tuple[str, int], List[Path]]:
+        """Agrupa por naranja las fotos terminadas en la bandeja (ignora archivos .tmp u otros)."""
+        files = [p for p in self.inbox_dir.iterdir() if p.is_file()]
+        groups, _ = group_photos_by_orange(files)
+        return groups
+
+    def read_photos(self, paths: Sequence[Path]) -> Tuple[List[np.ndarray], List[str], float]:
+        """Lee y decodifica fotos desde RAM. Retorna (frames, nombres, latencia_ms) de las legibles."""
+        t0 = time.perf_counter()
+        frames: List[np.ndarray] = []
+        names: List[str] = []
+        for path in paths:
+            try:
+                buf = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            frame = cv2.imdecode(np.frombuffer(buf, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is not None:
+                frames.append(frame)
+                names.append(path.name)
+        return frames, names, (time.perf_counter() - t0) * 1000.0
+
+    def remove_photos(self, paths: Sequence[Path]) -> None:
+        for path in paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def write_orange_result(self, payload: Dict[str, Any]) -> Path:
+        """Escribe de forma atómica el resultado de una naranja en results/<orange_id>.json."""
+        result_path = self.results_dir / f"{payload['orange_id']}.json"
+        tmp_path = result_path.with_name(result_path.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        tmp_path.replace(result_path)
+        return result_path
+
+    def wait_for_orange_result_in_station1(
+        self,
+        orange_id: str,
+        timeout_sec: float = 5.0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Usado por la Estación 1: espera el resultado de la naranja <uid>-<n>, lo retorna
+        y lo elimina de la carpeta de resultados. Retorna None si se agota el tiempo.
+        """
+        result_path = self.results_dir / f"{orange_id}.json"
+        t_expire = time.time() + timeout_sec
+        while time.time() < t_expire:
+            if result_path.exists():
+                try:
+                    with open(result_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    result_path.unlink()
+                    return data
+                except (json.JSONDecodeError, PermissionError, FileNotFoundError):
+                    pass
+            time.sleep(0.001)
+        return None
 
     def send_frame_from_station1(self, frame_bgr: np.ndarray, quality: int = 95) -> float:
         """
@@ -151,7 +261,11 @@ class StationCommunicator:
 
     def cleanup(self) -> None:
         """Limpia los archivos temporales creados en /dev/shm."""
-        for p in (self.frame_path, self.trigger_path, self.result_path, self.ack_path):
+        paths = [self.frame_path, self.trigger_path, self.result_path, self.ack_path]
+        for folder in (self.inbox_dir, self.results_dir):
+            if folder.exists():
+                paths.extend(p for p in folder.iterdir() if p.is_file())
+        for p in paths:
             if p.exists():
                 try:
                     p.unlink()
@@ -170,12 +284,67 @@ class StationListener:
         predictor: QualityPredictor,
         shm_dir: Optional[Union[str, Path]] = None,
         poll_interval_sec: float = 0.002,
+        expected_photos: int = EXPECTED_PHOTOS_PER_ORANGE,
+        photo_timeout_sec: float = DEFAULT_PHOTO_TIMEOUT_SEC,
     ):
         self.predictor = predictor
         self.communicator = StationCommunicator(shm_dir=shm_dir)
         self.poll_interval = poll_interval_sec
+        self.expected_photos = expected_photos
+        self.photo_timeout_sec = photo_timeout_sec
         self.running = False
         self.processed_count = 0
+
+    def process_pending_oranges(self) -> List[Dict[str, Any]]:
+        """
+        Califica las naranjas listas en la bandeja de fotos:
+        - Completa: llegaron `expected_photos` fotos legibles -> se procesa de inmediato.
+        - Incompleta: si la foto más antigua supera `photo_timeout_sec`, se califica con
+          las fotos disponibles (campo "complete": false). Si ninguna es legible, se
+          entrega un resultado con "error" para que la Estación 1 no quede esperando.
+        Las fotos procesadas se eliminan de la bandeja.
+        """
+        results: List[Dict[str, Any]] = []
+        now = time.time()
+
+        for (uid, orange_number), paths in self.communicator.list_pending_oranges().items():
+            try:
+                oldest_mtime = min(p.stat().st_mtime for p in paths)
+            except FileNotFoundError:
+                continue
+            timed_out = (now - oldest_mtime) >= self.photo_timeout_sec
+            if len(paths) < self.expected_photos and not timed_out:
+                continue
+
+            t_cycle_start = time.perf_counter()
+            frames, names, read_latency_ms = self.communicator.read_photos(paths)
+            if len(frames) < len(paths) and not timed_out:
+                continue  # Alguna foto aún no es legible; reintentar en el próximo ciclo
+
+            if not frames:
+                payload: Dict[str, Any] = {
+                    "station_id": 2,
+                    "timestamp": round(time.time(), 3),
+                    "uid": uid,
+                    "orange_number": orange_number,
+                    "orange_id": f"{uid}-{orange_number}",
+                    "error": "Ninguna foto de la naranja pudo decodificarse.",
+                    "photos_count": 0,
+                    "expected_photos": self.expected_photos,
+                    "complete": False,
+                }
+            else:
+                orange_res = self.predictor.predict_orange(frames, photo_names=names)
+                payload = build_orange_payload(uid, orange_number, orange_res, self.expected_photos)
+                payload["latency_read_shm_ms"] = round(read_latency_ms, 2)
+                payload["latency_total_ms"] = round((time.perf_counter() - t_cycle_start) * 1000.0, 2)
+
+            self.communicator.write_orange_result(payload)
+            self.communicator.remove_photos(paths)
+            self.processed_count += 1
+            results.append(payload)
+
+        return results
 
     def process_pending_event(self) -> Optional[Dict[str, Any]]:
         """Procesa un evento pendiente si el archivo trigger existe."""
@@ -220,13 +389,19 @@ class StationListener:
         print("=" * 70)
         print("ESTACIÓN 2: SERVICIO DE ESCUCHA INTER-ESTACIONES (RAM /dev/shm)")
         print(f"Canal de memoria compartida: {self.communicator.shm_dir}")
+        print(f"Bandeja de fotos por naranja:  {self.communicator.inbox_dir} "
+              f"({self.expected_photos} fotos/naranja, espera máx. {self.photo_timeout_sec:.1f}s)")
+        print(f"Resultados por naranja:        {self.communicator.results_dir}")
         print("Estado: Esperando señales de captura desde Estación 1...")
         print("=" * 70)
 
         try:
             while self.running:
+                handled = False
+
                 result = self.process_pending_event()
                 if result is not None:
+                    handled = True
                     print(
                         f"[EVENTO #{self.processed_count:04d}] "
                         f"Calidad: {result['predicted_class'].upper():<20} ({result['confidence_percent']:5.1f}%) | "
@@ -234,10 +409,25 @@ class StationListener:
                         f"Inf: {result['latency_inference_ms']:.2f}ms | "
                         f"Total: {result['latency_total_ms']:.2f}ms"
                     )
-                    if max_events is not None and self.processed_count >= max_events:
-                        print(f"[INFO] Límite de {max_events} eventos procesados alcanzado.")
-                        break
-                else:
+
+                for orange in self.process_pending_oranges():
+                    handled = True
+                    if "error" in orange:
+                        print(f"[NARANJA {orange['orange_id']}] ERROR: {orange['error']}")
+                        continue
+                    print(
+                        f"[NARANJA {orange['orange_id']}] "
+                        f"Calidad promedio: {orange['predicted_class'].upper():<20} "
+                        f"({orange['confidence_percent']:5.1f}%) | "
+                        f"Fotos: {orange['photos_count']}/{orange['expected_photos']}"
+                        f"{'' if orange['photos_agree'] else ' (no coinciden)'} | "
+                        f"Total: {orange['latency_total_ms']:.2f}ms"
+                    )
+
+                if max_events is not None and self.processed_count >= max_events:
+                    print(f"[INFO] Límite de {max_events} eventos procesados alcanzado.")
+                    break
+                if not handled:
                     time.sleep(self.poll_interval)
         except KeyboardInterrupt:
             print("\n[INFO] Detención del servicio solicitada por el usuario.")
@@ -342,6 +532,18 @@ def main():
         default=4,
         help="Hilos de inferencia para ONNX Runtime",
     )
+    parser.add_argument(
+        "--expected-photos",
+        type=int,
+        default=EXPECTED_PHOTOS_PER_ORANGE,
+        help="Fotos esperadas por naranja antes de calificarla (por defecto 2)",
+    )
+    parser.add_argument(
+        "--photo-timeout",
+        type=float,
+        default=DEFAULT_PHOTO_TIMEOUT_SEC,
+        help="Segundos a esperar fotos faltantes antes de calificar con las disponibles",
+    )
     args = parser.parse_args()
 
     if args.benchmark:
@@ -367,6 +569,8 @@ def main():
     listener = StationListener(
         predictor=predictor,
         shm_dir=args.shm_dir,
+        expected_photos=args.expected_photos,
+        photo_timeout_sec=args.photo_timeout,
     )
 
     max_events = 1 if args.once else None

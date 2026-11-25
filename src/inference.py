@@ -15,8 +15,10 @@ Características:
 """
 
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, Union, List
+from typing import Dict, Any, Tuple, Optional, Union, List, Sequence
 import argparse
+import json
+import re
 import sys
 import time
 import threading
@@ -75,6 +77,85 @@ CLASS_COLORS_BGR = {
     "marginalmente_buena": (0, 200, 240),  # Amarillo / Ámbar
     "mal_estado": (40, 40, 220),           # Rojo
 }
+
+# Convención de nombres de las fotos que entrega la Estación 1 (varias fotos por naranja):
+#   <uid>-<n_naranja>.<n_foto>[.ext]   ej: 7712323-1.1.jpg, 7712323-1.2.jpg, 7712323-2.1.jpg
+ORANGE_PHOTO_PATTERN = re.compile(r"^(?P<uid>.+)-(?P<orange>\d+)\.(?P<photo>\d+)$")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+EXPECTED_PHOTOS_PER_ORANGE = 2
+
+
+def parse_orange_photo_name(path: Union[str, Path]) -> Optional[Tuple[str, int, int]]:
+    """
+    Extrae (uid, numero_naranja, numero_foto) del nombre de archivo.
+    Acepta nombres con o sin extensión de imagen: '7712323-1.2.jpg' o '7712323-1.2'.
+    Retorna None si el nombre no sigue la convención.
+    """
+    name = Path(path).name
+    if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
+        name = Path(name).stem
+    match = ORANGE_PHOTO_PATTERN.match(name)
+    if match is None:
+        return None
+    return match.group("uid"), int(match.group("orange")), int(match.group("photo"))
+
+
+def group_photos_by_orange(
+    paths: Sequence[Union[str, Path]],
+) -> Tuple[Dict[Tuple[str, int], List[Path]], List[Path]]:
+    """
+    Agrupa rutas de fotos por naranja (uid, numero_naranja), ordenadas por número de foto.
+    Retorna (grupos, rutas_que_no_siguen_la_convencion).
+    """
+    groups: Dict[Tuple[str, int], List[Tuple[int, Path]]] = {}
+    unmatched: List[Path] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        parsed = parse_orange_photo_name(path)
+        if parsed is None:
+            unmatched.append(path)
+            continue
+        uid, orange_number, photo_number = parsed
+        groups.setdefault((uid, orange_number), []).append((photo_number, path))
+
+    ordered = {
+        key: [path for _, path in sorted(items)]
+        for key, items in sorted(groups.items())
+    }
+    return ordered, unmatched
+
+
+def aggregate_probabilities(
+    probs_list: Sequence[np.ndarray],
+    class_names: Sequence[str],
+) -> Dict[str, Any]:
+    """
+    Promedia las probabilidades Softmax de varias fotos de una misma naranja
+    (soft voting) y entrega la clase final con su confianza promedio.
+    """
+    if len(probs_list) == 0:
+        raise ValueError("Se requiere al menos una distribución de probabilidades.")
+
+    stacked = np.stack([np.asarray(p, dtype=np.float64).reshape(-1) for p in probs_list])
+    if stacked.shape[1] != len(class_names):
+        raise ValueError(
+            f"Cada foto debe tener {len(class_names)} probabilidades; se recibieron {stacked.shape[1]}."
+        )
+
+    mean_probs = stacked.mean(axis=0)
+    best_idx = int(np.argmax(mean_probs))
+    best_conf = float(mean_probs[best_idx])
+    per_photo_classes = {int(i) for i in stacked.argmax(axis=1)}
+
+    return {
+        "predicted_class": class_names[best_idx],
+        "confidence": round(best_conf, 4),
+        "confidence_percent": round(best_conf * 100.0, 2),
+        "probabilities": {
+            name: round(float(prob), 4) for name, prob in zip(class_names, mean_probs)
+        },
+        "photos_agree": len(per_photo_classes) == 1,
+    }
 
 
 def softmax_numpy(logits: np.ndarray) -> np.ndarray:
@@ -285,8 +366,8 @@ class QualityPredictor:
             providers=providers,
         )
         self.input_name = self.session.get_inputs()[0].name
-        print(f"[QualityPredictor] Sesión ONNX cargada: {model_path.name}")
-        print(f"[QualityPredictor] Hilos intra-op: {self.num_threads} | Proveedores: {self.session.get_providers()}")
+        print(f"[QualityPredictor] Sesión ONNX cargada: {model_path.name}", file=sys.stderr)
+        print(f"[QualityPredictor] Hilos intra-op: {self.num_threads} | Proveedores: {self.session.get_providers()}", file=sys.stderr)
 
     def _load_pytorch_model(self, model_path: Optional[Union[str, Path]], device: Optional[str] = None) -> None:
         """Carga el modelo PyTorch tradicional (.pth)."""
@@ -303,11 +384,77 @@ class QualityPredictor:
                 self.class_names = checkpoint.get("class_names", self.class_names)
             elif isinstance(checkpoint, dict):
                 self.model.load_state_dict(checkpoint)
-            print(f"[QualityPredictor] Modelo PyTorch cargado desde: {model_path}")
+            print(f"[QualityPredictor] Modelo PyTorch cargado desde: {model_path}", file=sys.stderr)
         else:
-            print("[QualityPredictor] Aviso: Sin archivo de pesos. Usando arquitectura no entrenada.")
+            print("[QualityPredictor] Aviso: Sin archivo de pesos. Usando arquitectura no entrenada.", file=sys.stderr)
         self.model.to(self.device)
         self.model.eval()
+
+    def _infer_probs(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, float, float]:
+        """
+        Ejecuta preprocesamiento + inferencia de un frame BGR.
+        Retorna (probabilidades[num_classes], latencia_preproceso_ms, latencia_inferencia_ms).
+        """
+        # 1. Preprocesamiento Zero-Copy
+        t0 = time.perf_counter()
+        input_tensor = preprocess_cv2_fast(frame_bgr, target_size=224)
+        prep_latency_ms = (time.perf_counter() - t0) * 1000.0
+
+        # 2. Inferencia pura
+        t_inf_start = time.perf_counter()
+        if self.use_onnx:
+            raw_logits = self.session.run(None, {self.input_name: input_tensor})[0]
+            probs_arr = softmax_numpy(raw_logits)[0]
+        else:
+            with torch.no_grad():
+                torch_in = torch.from_numpy(input_tensor).to(self.device)
+                logits = self.model(torch_in)
+                probs_arr = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+        inf_latency_ms = (time.perf_counter() - t_inf_start) * 1000.0
+
+        return np.asarray(probs_arr, dtype=np.float32), prep_latency_ms, inf_latency_ms
+
+    def predict_orange(
+        self,
+        frames_bgr: Sequence[np.ndarray],
+        photo_names: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Califica una naranja a partir de varias fotos (p. ej. 2 por naranja).
+        Promedia las probabilidades de todas las fotos y entrega la clase final
+        con su confianza promedio, junto al detalle de cada foto.
+        """
+        if len(frames_bgr) == 0:
+            raise ValueError("Se requiere al menos una foto por naranja.")
+        if photo_names is not None and len(photo_names) != len(frames_bgr):
+            raise ValueError("photo_names debe tener el mismo largo que frames_bgr.")
+
+        probs_list: List[np.ndarray] = []
+        photos: List[Dict[str, Any]] = []
+        prep_total_ms = 0.0
+        inf_total_ms = 0.0
+
+        for i, frame in enumerate(frames_bgr):
+            probs, prep_ms, inf_ms = self._infer_probs(frame)
+            probs_list.append(probs)
+            prep_total_ms += prep_ms
+            inf_total_ms += inf_ms
+
+            photo_result = aggregate_probabilities([probs], self.class_names)
+            photo_result.pop("photos_agree")
+            if photo_names is not None:
+                photo_result = {"image_name": photo_names[i], **photo_result}
+            photos.append(photo_result)
+
+        result = aggregate_probabilities(probs_list, self.class_names)
+        result.update({
+            "photos_count": len(frames_bgr),
+            "photos": photos,
+            "latency_preprocess_ms": round(prep_total_ms, 2),
+            "latency_inference_ms": round(inf_total_ms, 2),
+            "latency_ms": round(prep_total_ms + inf_total_ms, 2),
+        })
+        return result
 
     def predict_cv2(self, frame_bgr: np.ndarray) -> Tuple[Dict[str, Any], np.ndarray]:
         """
@@ -317,29 +464,9 @@ class QualityPredictor:
         Retorna:
             (resultado_dict, frame_anotado)
         """
-        # 1. Preprocesamiento Zero-Copy
-        t0 = time.perf_counter()
-        input_tensor = preprocess_cv2_fast(frame_bgr, target_size=224)
-        t_prep_end = time.perf_counter()
-        prep_latency_ms = (t_prep_end - t0) * 1000.0
-
-        # 2. Inferencia pura
-        t_inf_start = time.perf_counter()
-        if self.use_onnx:
-            raw_logits = self.session.run(None, {self.input_name: input_tensor})[0]
-            probs_arr = softmax_numpy(raw_logits)[0]
-            best_idx = int(np.argmax(raw_logits, axis=1)[0])
-        else:
-            with torch.no_grad():
-                torch_in = torch.from_numpy(input_tensor).to(self.device)
-                logits = self.model(torch_in)
-                probs_tensor = F.softmax(logits, dim=1).squeeze(0)
-                probs_arr = probs_tensor.cpu().numpy()
-                best_idx = int(torch.argmax(logits, dim=1).item())
-
-        t_inf_end = time.perf_counter()
-        inf_latency_ms = (t_inf_end - t_inf_start) * 1000.0
-        total_latency_ms = (t_inf_end - t0) * 1000.0
+        probs_arr, prep_latency_ms, inf_latency_ms = self._infer_probs(frame_bgr)
+        total_latency_ms = prep_latency_ms + inf_latency_ms
+        best_idx = int(np.argmax(probs_arr))
 
         best_class = self.class_names[best_idx]
         best_conf = float(probs_arr[best_idx])
@@ -584,9 +711,111 @@ def run_camera_stream(
         print("=" * 70)
 
 
+def classify_oranges(
+    predictor: QualityPredictor,
+    image_paths: Sequence[Union[str, Path]],
+    expected_photos: int = EXPECTED_PHOTOS_PER_ORANGE,
+) -> List[Dict[str, Any]]:
+    """
+    Agrupa las fotos por naranja según su nombre (<uid>-<naranja>.<foto>),
+    califica cada naranja promediando sus fotos y retorna un resultado por naranja.
+    Los avisos se emiten por stderr para no contaminar la salida JSON.
+    """
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV es requerido para leer las imágenes.")
+
+    groups, unmatched = group_photos_by_orange(image_paths)
+    for path in unmatched:
+        print(
+            f"[AVISO] '{path.name}' no sigue el formato <uid>-<naranja>.<foto>; se omite.",
+            file=sys.stderr,
+        )
+
+    results: List[Dict[str, Any]] = []
+    for (uid, orange_number), paths in groups.items():
+        orange_id = f"{uid}-{orange_number}"
+        frames: List[np.ndarray] = []
+        names: List[str] = []
+        for path in paths:
+            frame = cv2.imread(str(path)) if path.exists() else None
+            if frame is None:
+                print(f"[AVISO] No se pudo leer la foto {path} (naranja {orange_id}).", file=sys.stderr)
+                continue
+            frames.append(frame)
+            names.append(path.name)
+
+        if not frames:
+            print(f"[AVISO] Naranja {orange_id} sin fotos válidas; no se califica.", file=sys.stderr)
+            continue
+        if len(frames) != expected_photos:
+            print(
+                f"[AVISO] Naranja {orange_id}: {len(frames)} foto(s) válidas, "
+                f"se esperaban {expected_photos}. Se promedian las disponibles.",
+                file=sys.stderr,
+            )
+
+        res = predictor.predict_orange(frames, photo_names=names)
+        results.append(build_orange_payload(uid, orange_number, res, expected_photos))
+
+    return results
+
+
+def build_orange_payload(
+    uid: str,
+    orange_number: int,
+    orange_result: Dict[str, Any],
+    expected_photos: int = EXPECTED_PHOTOS_PER_ORANGE,
+) -> Dict[str, Any]:
+    """Arma el JSON estandarizado de salida por naranja (CLI y servicio inter-estaciones)."""
+    return {
+        "station_id": 2,
+        "timestamp": round(time.time(), 3),
+        "uid": uid,
+        "orange_number": orange_number,
+        "orange_id": f"{uid}-{orange_number}",
+        "predicted_class": orange_result["predicted_class"],
+        "confidence_percent": orange_result["confidence_percent"],
+        "probabilities": orange_result["probabilities"],
+        "photos_count": orange_result["photos_count"],
+        "expected_photos": expected_photos,
+        "complete": orange_result["photos_count"] == expected_photos,
+        "photos_agree": orange_result["photos_agree"],
+        "photos": orange_result["photos"],
+        "latency_preprocess_ms": orange_result["latency_preprocess_ms"],
+        "latency_inference_ms": orange_result["latency_inference_ms"],
+        "latency_total_ms": orange_result["latency_ms"],
+    }
+
+
+def print_orange_results(results: Sequence[Dict[str, Any]]) -> None:
+    """Imprime los resultados por naranja en formato legible."""
+    for res in results:
+        print("\n" + "=" * 55)
+        print(f"NARANJA {res['orange_id']}  (UID {res['uid']}, n° {res['orange_number']})")
+        print("=" * 55)
+        print(f"Calidad Promedio:        {res['predicted_class']}")
+        print(f"Confianza Promedio:      {res['confidence_percent']}%")
+        print(f"Fotos analizadas:        {res['photos_count']}/{res['expected_photos']}"
+              f"{'' if res['photos_agree'] else '  (las fotos NO coinciden)'}")
+        print("Probabilidades promedio:")
+        for cls, prob in res["probabilities"].items():
+            print(f"  - {cls:<22}: {prob * 100:.2f}%")
+        print("Detalle por foto:")
+        for photo in res["photos"]:
+            print(f"  - {photo['image_name']:<24}: {photo['predicted_class']} ({photo['confidence_percent']}%)")
+        print(f"Latencia Total:          {res['latency_total_ms']} ms")
+    print("=" * 55)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Inferencia y Calidad Visual (OrangeQuality-AI - Edge)")
-    parser.add_argument("--image", type=str, default=None, help="Ruta a una imagen para clasificar")
+    parser.add_argument(
+        "--image", type=str, nargs="+", default=None,
+        help="Una o más imágenes. Si siguen el formato <uid>-<naranja>.<foto> (ej. 7712323-1.1.jpg), "
+             "se agrupan por naranja y se promedia la calificación de sus fotos.",
+    )
+    parser.add_argument("--dir", type=str, default=None, help="Carpeta con fotos <uid>-<naranja>.<foto> a calificar por naranja")
+    parser.add_argument("--expected-photos", type=int, default=EXPECTED_PHOTOS_PER_ORANGE, help="Fotos esperadas por naranja (por defecto 2)")
     parser.add_argument("--json", action="store_true", help="Retorna la salida exclusivamente en formato JSON estándar")
     parser.add_argument("--webcam", type=int, default=None, help="Índice de cámara para inferencia en vivo")
     parser.add_argument("--picam", action="store_true", help="Usa la cámara CSI oficial de Raspberry Pi (Picamera2)")
@@ -634,14 +863,44 @@ def main():
         num_threads=args.threads,
     )
 
-    if args.image:
+    image_paths: List[Path] = [Path(p) for p in (args.image or [])]
+    if args.dir:
+        dir_path = Path(args.dir)
+        if not dir_path.is_dir():
+            print(f"Error: No existe la carpeta {dir_path}", file=sys.stderr)
+            return
+        image_paths.extend(sorted(
+            p for p in dir_path.iterdir()
+            if p.is_file() and (p.suffix.lower() in IMAGE_EXTENSIONS or parse_orange_photo_name(p))
+        ))
+        if not image_paths:
+            print(f"Error: La carpeta {dir_path} no contiene imágenes.", file=sys.stderr)
+            return
+
+    # Fotos con formato <uid>-<naranja>.<foto>: calificación promediada por naranja
+    if image_paths and (args.dir or len(image_paths) > 1 or parse_orange_photo_name(image_paths[0])):
+        if not HAS_OPENCV:
+            raise RuntimeError(
+                "OpenCV no está disponible. Instálalo con "
+                "'python -m pip install opencv-python' y vuelve a ejecutar."
+            )
+        results = classify_oranges(predictor, image_paths, expected_photos=args.expected_photos)
+        if args.json:
+            print(json.dumps(results, indent=2))
+        elif results:
+            print_orange_results(results)
+        else:
+            print("No se pudo calificar ninguna naranja.", file=sys.stderr)
+        return
+
+    if image_paths:
         if not HAS_OPENCV:
             raise RuntimeError(
                 "OpenCV no está disponible. Instálalo con "
                 "'python -m pip install opencv-python' y vuelve a ejecutar."
             )
 
-        image_path = Path(args.image)
+        image_path = image_paths[0]
         if not image_path.exists():
             print(f"Error: No existe el archivo {image_path}")
             return
@@ -653,7 +912,6 @@ def main():
 
         res, _ = predictor.predict_cv2(frame)
         if args.json:
-            import json
             payload = {
                 "station_id": 2,
                 "timestamp": round(time.time(), 3),
