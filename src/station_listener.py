@@ -296,25 +296,33 @@ class StationListener:
         self.photo_timeout_sec = photo_timeout_sec
         self.running = False
         self.processed_count = 0
+        # Momento en que el servicio vio por primera vez cada naranja en la bandeja.
+        # No se usa la fecha de modificación de los archivos: una copia (Copy-Item,
+        # scp -p, rsync -a) conserva la fecha original y la naranja parecería vencida.
+        self._first_seen: Dict[Tuple[str, int], float] = {}
 
     def process_pending_oranges(self) -> List[Dict[str, Any]]:
         """
         Califica las naranjas listas en la bandeja de fotos:
         - Completa: llegaron `expected_photos` fotos legibles -> se procesa de inmediato.
-        - Incompleta: si la foto más antigua supera `photo_timeout_sec`, se califica con
-          las fotos disponibles (campo "complete": false). Si ninguna es legible, se
-          entrega un resultado con "error" para que la Estación 1 no quede esperando.
+        - Incompleta: si pasaron `photo_timeout_sec` desde que el servicio vio la naranja
+          por primera vez, se califica con las fotos disponibles (campo "complete": false).
+          Si ninguna es legible, se entrega un resultado con "error" para que la
+          Estación 1 no quede esperando.
         Las fotos procesadas se eliminan de la bandeja.
         """
         results: List[Dict[str, Any]] = []
         now = time.time()
+        pending = self.communicator.list_pending_oranges()
 
-        for (uid, orange_number), paths in self.communicator.list_pending_oranges().items():
-            try:
-                oldest_mtime = min(p.stat().st_mtime for p in paths)
-            except FileNotFoundError:
-                continue
-            timed_out = (now - oldest_mtime) >= self.photo_timeout_sec
+        # Olvidar naranjas que ya no están en la bandeja (procesadas o retiradas)
+        for key in list(self._first_seen):
+            if key not in pending:
+                del self._first_seen[key]
+
+        for (uid, orange_number), paths in pending.items():
+            first_seen = self._first_seen.setdefault((uid, orange_number), now)
+            timed_out = (now - first_seen) >= self.photo_timeout_sec
             if len(paths) < self.expected_photos and not timed_out:
                 continue
 
@@ -343,6 +351,7 @@ class StationListener:
 
             self.communicator.write_orange_result(payload)
             self.communicator.remove_photos(paths)
+            self._first_seen.pop((uid, orange_number), None)
             self.processed_count += 1
             results.append(payload)
 

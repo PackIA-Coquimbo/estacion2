@@ -53,6 +53,12 @@ def age_files(folder: Path, seconds: float) -> None:
         os.utime(p, (old, old))
 
 
+def age_pending(listener: StationListener, seconds: float) -> None:
+    """Simula que el servicio vio las naranjas pendientes hace `seconds` segundos."""
+    for key in listener._first_seen:
+        listener._first_seen[key] -= seconds
+
+
 def test_complete_orange_is_averaged_and_delivered(tmp_path):
     listener = make_listener(tmp_path)
     comm = listener.communicator
@@ -84,13 +90,28 @@ def test_incomplete_orange_waits_then_is_graded_after_timeout(tmp_path):
     assert listener.process_pending_oranges() == []
     assert len(list(comm.inbox_dir.iterdir())) == 1
 
-    age_files(comm.inbox_dir, 10.0)
+    age_pending(listener, 10.0)
     results = listener.process_pending_oranges()
 
     assert len(results) == 1
     assert results[0]["predicted_class"] == "mal_estado"
     assert results[0]["photos_count"] == 1
     assert results[0]["complete"] is False
+
+
+def test_copied_photo_with_old_date_still_waits_for_second_photo(tmp_path):
+    # Copy-Item / scp -p conservan la fecha original: la naranja no debe darse por vencida
+    listener = make_listener(tmp_path, timeout=5.0)
+    comm = listener.communicator
+    comm.send_orange_photos_from_station1("7712323", 1, [BRIGHT])
+    age_files(comm.inbox_dir, 3600.0)
+
+    assert listener.process_pending_oranges() == []
+
+    comm.send_orange_photos_from_station1("7712323", 1, [BRIGHT, DARK])
+    results = listener.process_pending_oranges()
+    assert len(results) == 1 and results[0]["photos_count"] == 2
+    assert listener._first_seen == {}
 
 
 def test_multiple_oranges_and_tmp_files(tmp_path):
@@ -119,7 +140,7 @@ def test_unreadable_photos_produce_error_result_after_timeout(tmp_path):
 
     assert listener.process_pending_oranges() == []  # se reintenta antes del timeout
 
-    age_files(comm.inbox_dir, 10.0)
+    age_pending(listener, 10.0)
     results = listener.process_pending_oranges()
 
     assert len(results) == 1 and "error" in results[0]
