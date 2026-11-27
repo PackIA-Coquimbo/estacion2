@@ -12,6 +12,7 @@ RestartSec=3
 StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1
+Environment=E5_API_URL=http://192.168.0.10:8000
 
 [Install]
 WantedBy=multi-user.target

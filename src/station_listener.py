@@ -33,6 +33,13 @@ except ImportError:
     HAS_OPENCV = False
 
 from src.inference import QualityPredictor
+from src.e5_client import (
+    DEFAULT_E5_BASE_URL,
+    E5Client,
+    build_e2_payload,
+    map_prediction_to_e2_datos,
+    utc_timestamp_iso,
+)
 
 
 def get_default_shm_dir() -> Path:
@@ -63,12 +70,20 @@ class StationCommunicator:
         # Rutas de sincronización e intercambio en RAM
         self.frame_path = self.shm_dir / "estacion_frame.jpg"
         self.trigger_path = self.shm_dir / "estacion_trigger.flag"
+        self.manifest_path = self.shm_dir / "estacion_manifest.json"
         self.result_path = self.shm_dir / "estacion2_result.json"
         self.ack_path = self.shm_dir / "estacion_ack.flag"
 
-    def send_frame_from_station1(self, frame_bgr: np.ndarray, quality: int = 95) -> float:
+    def send_frame_from_station1(
+        self,
+        frame_bgr: np.ndarray,
+        quality: int = 95,
+        id_lote: Optional[str] = None,
+        id_fruta: Optional[str] = None,
+    ) -> float:
         """
         Método utilizado por la Estación 1 (o simulador) para enviar un frame a la Estación 2 vía RAM.
+        Opcionalmente recibe id_lote e id_fruta del manifiesto de E1.
         Retorna el tiempo de escritura en RAM en milisegundos.
         """
         if not HAS_OPENCV:
@@ -79,6 +94,14 @@ class StationCommunicator:
         # Limpiar banderas anteriores
         if self.ack_path.exists():
             self.ack_path.unlink()
+
+        # Escribir o limpiar manifiesto de E1 en RAM
+        if id_lote is not None or id_fruta is not None:
+            manifest_data = {"id_lote": id_lote, "id_fruta": id_fruta}
+            with open(self.manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest_data, f)
+        elif self.manifest_path.exists():
+            self.manifest_path.unlink()
 
         # Escribir frame comprimido directamente en /dev/shm
         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
@@ -120,6 +143,27 @@ class StationCommunicator:
 
         return True, frame_bgr, read_latency_ms
 
+    def read_manifest_in_station2(self) -> Dict[str, Optional[str]]:
+        """
+        Lee los identificadores (id_lote, id_fruta) del manifiesto enviado por E1 en RAM.
+        Acepta tanto `estacion_manifest.json` como un JSON embebido en `estacion_trigger.flag`.
+        """
+        for candidate in (self.manifest_path, self.trigger_path):
+            if candidate.exists():
+                try:
+                    with open(candidate, "r", encoding="utf-8") as f:
+                        raw = f.read().strip()
+                    if raw.startswith("{"):
+                        data = json.loads(raw)
+                        if isinstance(data, dict):
+                            return {
+                                "id_lote": data.get("id_lote"),
+                                "id_fruta": data.get("id_fruta"),
+                            }
+                except (json.JSONDecodeError, OSError):
+                    pass
+        return {"id_lote": None, "id_fruta": None}
+
     def write_result_from_station2(self, result_dict: Dict[str, Any]) -> None:
         """Escribe el resultado estructurado JSON en /dev/shm y levanta el flag de ACK."""
         # Escritura atómica en el mismo sistema de archivos en RAM
@@ -151,7 +195,7 @@ class StationCommunicator:
 
     def cleanup(self) -> None:
         """Limpia los archivos temporales creados en /dev/shm."""
-        for p in (self.frame_path, self.trigger_path, self.result_path, self.ack_path):
+        for p in (self.frame_path, self.trigger_path, self.manifest_path, self.result_path, self.ack_path):
             if p.exists():
                 try:
                     p.unlink()
@@ -163,17 +207,20 @@ class StationListener:
     """
     Servicio de escucha de eventos (Listener) de la Estación 2.
     Espera señales de la Estación 1, lee la imagen en RAM (/dev/shm),
-    ejecuta la predicción de calidad visual y entrega el resultado estandarizado.
+    ejecuta la predicción de calidad visual, entrega el resultado en RAM
+    y, cuando hay manifiesto E1 y cliente E5 activo, envía POST /api/v1/ingest/e2.
     """
     def __init__(
         self,
         predictor: QualityPredictor,
         shm_dir: Optional[Union[str, Path]] = None,
         poll_interval_sec: float = 0.002,
+        e5_client: Optional[E5Client] = None,
     ):
         self.predictor = predictor
         self.communicator = StationCommunicator(shm_dir=shm_dir)
         self.poll_interval = poll_interval_sec
+        self.e5_client = e5_client
         self.running = False
         self.processed_count = 0
 
@@ -183,6 +230,11 @@ class StationListener:
             return None
 
         t_cycle_start = time.perf_counter()
+
+        # 0. Leer manifiesto E1 (id_lote, id_fruta) antes de consumir el trigger
+        manifest = self.communicator.read_manifest_in_station2()
+        id_lote = manifest.get("id_lote")
+        id_fruta = manifest.get("id_fruta")
 
         # 1. Leer frame directamente de memoria RAM (/dev/shm)
         success, frame_bgr, read_latency_ms = self.communicator.read_frame_in_station2()
@@ -195,22 +247,62 @@ class StationListener:
         t_cycle_end = time.perf_counter()
         total_transfer_infer_ms = (t_cycle_end - t_cycle_start) * 1000.0
 
-        # 3. Construir estructura JSON estandarizada según especificación de Fase 4
-        result_payload = {
+        # 3. Mapear resultado al contrato v3 de E5
+        e2_datos = map_prediction_to_e2_datos(
+            predicted_class=pred_res["predicted_class"],
+            confidence=pred_res["confidence"],
+        )
+        iso_ts = utc_timestamp_iso()
+
+        # Construir estructura JSON en RAM (compatible con Fase 4 + campos v3)
+        result_payload: Dict[str, Any] = {
             "station_id": 2,
+            "estacion": "E2",
             "timestamp": round(time.time(), 3),
+            "timestamp_iso": iso_ts,
             "predicted_class": pred_res["predicted_class"],
             "confidence_percent": pred_res["confidence_percent"],
+            "calidad_visual": e2_datos["calidad_visual"],
+            "confianza_visual": e2_datos["confianza_visual"],
+            "defectos_detectados": e2_datos["defectos_detectados"],
             "probabilities": pred_res["probabilities"],
             "latency_read_shm_ms": round(read_latency_ms, 2),
             "latency_preprocess_ms": pred_res["latency_preprocess_ms"],
             "latency_inference_ms": pred_res["latency_inference_ms"],
             "latency_total_ms": round(total_transfer_infer_ms, 2),
         }
+        if id_lote is not None:
+            result_payload["id_lote"] = id_lote
+        if id_fruta is not None:
+            result_payload["id_fruta"] = id_fruta
 
         # 4. Escribir resultado en /dev/shm y emitir ACK
         self.communicator.write_result_from_station2(result_payload)
         self.processed_count += 1
+
+        # 5. Enviar lectura v3 a Estación 5 (POST /api/v1/ingest/e2)
+        if self.e5_client is not None and self.e5_client.enabled:
+            if id_lote and id_fruta:
+                e5_payload = build_e2_payload(
+                    id_lote=id_lote,
+                    id_fruta=id_fruta,
+                    predicted_class=pred_res["predicted_class"],
+                    confidence=pred_res["confidence"],
+                    defects=e2_datos["defectos_detectados"],
+                    timestamp=iso_ts,
+                )
+                e5_sync = self.e5_client.send_e2_ingest(e5_payload)
+                result_payload["e5_sync"] = e5_sync
+                if not e5_sync.get("ok"):
+                    print(
+                        f"[E5 WARN] Fallo al enviar fruta={id_fruta} lote={id_lote} a E5: "
+                        f"status={e5_sync.get('status_code')} error={e5_sync.get('error')}"
+                    )
+            else:
+                print(
+                    "[E5 WARN] Manifiesto E1 sin id_lote/id_fruta; "
+                    "se omite el envío HTTP a POST /api/v1/ingest/e2."
+                )
 
         return result_payload
 
@@ -342,6 +434,29 @@ def main():
         default=4,
         help="Hilos de inferencia para ONNX Runtime",
     )
+    parser.add_argument(
+        "--e5-url",
+        type=str,
+        default=os.environ.get("E5_API_URL", DEFAULT_E5_BASE_URL),
+        help="URL base de la API de Estación 5 (por defecto http://192.168.0.10:8000)",
+    )
+    parser.add_argument(
+        "--no-e5",
+        action="store_true",
+        help="Desactiva el envío HTTP hacia Estación 5 (solo memoria compartida local)",
+    )
+    parser.add_argument(
+        "--e5-timeout",
+        type=float,
+        default=3.0,
+        help="Timeout HTTP en segundos para POST /api/v1/ingest/e2",
+    )
+    parser.add_argument(
+        "--e5-retries",
+        type=int,
+        default=3,
+        help="Cantidad de reintentos ante timeout/error de red hacia E5",
+    )
     args = parser.parse_args()
 
     if args.benchmark:
@@ -364,9 +479,17 @@ def main():
         num_threads=args.threads,
     )
 
+    e5_client = E5Client(
+        base_url=args.e5_url,
+        timeout_sec=args.e5_timeout,
+        max_retries=args.e5_retries,
+        enabled=not args.no_e5,
+    )
+
     listener = StationListener(
         predictor=predictor,
         shm_dir=args.shm_dir,
+        e5_client=e5_client,
     )
 
     max_events = 1 if args.once else None

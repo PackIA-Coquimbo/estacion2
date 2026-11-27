@@ -58,7 +58,12 @@ try:
 except ImportError:
     HAS_PIL = False
 
-# Clases por defecto del proyecto
+from src.e5_client import (
+    DEFAULT_E5_BASE_URL,
+    E5Client,
+    build_e2_payload,
+    map_prediction_to_e2_datos,
+)
 DEFAULT_CLASSES: List[str] = [
     "buen_estado",
     "marginalmente_buena",
@@ -597,6 +602,10 @@ def main():
     parser.add_argument("--export-onnx", type=str, default=None, help="Exportar modelo PyTorch a ONNX")
     parser.add_argument("--threads", type=int, default=4, help="Número de hilos de inferencia (por defecto 4)")
     parser.add_argument("--benchmark", action="store_true", help="Ejecuta benchmark de preprocesamiento Zero-Copy")
+    parser.add_argument("--lote", type=str, default=None, help="ID de lote E1 para formato v3 de E5 (ej. LOTE-2026-11-A)")
+    parser.add_argument("--fruta", type=str, default=None, help="ID de fruta E1 para formato v3 de E5 (ej. M-0001)")
+    parser.add_argument("--e5-url", type=str, default=DEFAULT_E5_BASE_URL, help="URL base de la API de E5")
+    parser.add_argument("--send-e5", action="store_true", help="Envía la lectura a POST /api/v1/ingest/e2 (requiere --lote y --fruta)")
     args = parser.parse_args()
 
     if args.benchmark:
@@ -652,19 +661,55 @@ def main():
             return
 
         res, _ = predictor.predict_cv2(frame)
+        e2_datos = map_prediction_to_e2_datos(
+            predicted_class=res["predicted_class"],
+            confidence=res["confidence"],
+        )
+
+        if args.send_e5:
+            if not args.lote or not args.fruta:
+                print("Error: --send-e5 requiere especificar --lote y --fruta.")
+                return
+            e5_payload = build_e2_payload(
+                id_lote=args.lote,
+                id_fruta=args.fruta,
+                predicted_class=res["predicted_class"],
+                confidence=res["confidence"],
+                defects=e2_datos["defectos_detectados"],
+            )
+            e5_res = E5Client(base_url=args.e5_url).send_e2_ingest(e5_payload)
+            if args.json:
+                import json
+                print(json.dumps({"payload": e5_payload, "e5_response": e5_res}, indent=2))
+                return
+            print(f"[E5] Respuesta POST /api/v1/ingest/e2: {e5_res}")
+
         if args.json:
             import json
-            payload = {
-                "station_id": 2,
-                "timestamp": round(time.time(), 3),
-                "image_name": image_path.name,
-                "predicted_class": res["predicted_class"],
-                "confidence_percent": res["confidence_percent"],
-                "probabilities": res["probabilities"],
-                "latency_preprocess_ms": res["latency_preprocess_ms"],
-                "latency_inference_ms": res["latency_inference_ms"],
-                "latency_total_ms": res["latency_ms"],
-            }
+            if args.lote and args.fruta:
+                payload = build_e2_payload(
+                    id_lote=args.lote,
+                    id_fruta=args.fruta,
+                    predicted_class=res["predicted_class"],
+                    confidence=res["confidence"],
+                    defects=e2_datos["defectos_detectados"],
+                )
+            else:
+                payload = {
+                    "station_id": 2,
+                    "estacion": "E2",
+                    "timestamp": round(time.time(), 3),
+                    "image_name": image_path.name,
+                    "predicted_class": res["predicted_class"],
+                    "confidence_percent": res["confidence_percent"],
+                    "calidad_visual": e2_datos["calidad_visual"],
+                    "confianza_visual": e2_datos["confianza_visual"],
+                    "defectos_detectados": e2_datos["defectos_detectados"],
+                    "probabilities": res["probabilities"],
+                    "latency_preprocess_ms": res["latency_preprocess_ms"],
+                    "latency_inference_ms": res["latency_inference_ms"],
+                    "latency_total_ms": res["latency_ms"],
+                }
             print(json.dumps(payload, indent=2))
             return
 
