@@ -1,16 +1,24 @@
-# Estación 2 en producción (Raspberry Pi 5)
+# Estación 2 en producción (Raspberry Pi)
 
-Carpeta del proyecto: `/home/icci/estacion2` (rama `feat/promedio-fotos-naranja` + integración E5).
+Funciona en cualquier Raspberry Pi 3B+/4/5 con **Raspberry Pi OS de 64 bits**
+(Bookworm o Trixie), con cualquier usuario y en cualquier carpeta.
 
-## 1. Instalar (una sola vez)
+## 1. Instalar (una sola vez por Raspberry)
 
 ```bash
-cd /home/icci/estacion2
+git clone https://github.com/PackIA-Coquimbo/estacion2.git
+cd estacion2
 sudo bash scripts/setup_raspberry.sh
 ```
 
-Instala paquetes, crea `.venv-pi`, deja la CPU en `performance`, instala y habilita
-el servicio `estacion2` (arranca solo en cada encendido).
+Instala paquetes, crea `.venv-pi`, deja la CPU en `performance`, instala, habilita
+e inicia el servicio `estacion2` (arranca solo en cada encendido). El usuario y la
+ruta se detectan automáticamente; los modelos `.onnx` vienen en el repositorio.
+
+Sin internet en la Pi: copiar la carpeta clonada (por ejemplo con `scp -r` o un pendrive)
+y ejecutar el mismo script; solo necesita red para `apt` y `pip`.
+
+Para actualizar: `git pull && sudo bash scripts/setup_raspberry.sh`.
 
 ## 2. Configurar
 
