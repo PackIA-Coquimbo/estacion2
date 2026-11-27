@@ -21,7 +21,15 @@ sudo nano /etc/default/estacion2
 | Variable | Uso |
 |---|---|
 | `E5_API_URL` | URL de la Estación 5 (por defecto `http://192.168.0.10:8000`) |
-| `E2_ARGS` | Opciones extra: `--no-e5`, `--photo-timeout 3`, `--threads 4` |
+| `E2_ARGS` | Opciones extra: `--no-e5`, `--photo-timeout 3`, `--threads 4`, `--model weights/orange_model_int8.onnx` |
+
+### Modelo
+
+Por defecto se usa `weights/orange_model.onnx` (FP32, ~92 ms por foto en Pi 5).
+El INT8 (`orange_model_int8.onnx`, ~30 ms por foto) es más rápido pero en una prueba
+con una mandarina con moho la calificó como `buen_estado` (77.8 %), mientras que
+FP32 la calificó correctamente como `mal_estado`. Usar INT8 solo tras validarlo
+con fotos reales de la cámara de E1.
 
 Después de cambiarlo: `sudo systemctl restart estacion2`.
 
@@ -75,7 +83,7 @@ cp pruebas/7712323-1.*.jpg /dev/shm/estacion2_inbox/
 cat /dev/shm/estacion2_results/7712323-1.json
 
 # Calificar fotos sueltas sin servicio:
-.venv-pi/bin/python src/inference.py --image a-1.1.jpg a-1.2.jpg --onnx weights/orange_model_int8.onnx --json
+.venv-pi/bin/python src/inference.py --image a-1.1.jpg a-1.2.jpg --onnx weights/orange_model.onnx --json
 
 # Tests
 .venv-pi/bin/python -m pytest tests -q --ignore=tests/smoke_test.py

@@ -46,8 +46,8 @@ sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install --no-cache-dir -r "$PROJECT_ROOT
 sudo -u "$APP_USER" "$VENV_DIR/bin/python" -c \
     "import onnxruntime, numpy, cv2; print('  onnxruntime', onnxruntime.__version__, '| numpy', numpy.__version__, '| opencv', cv2.__version__)"
 
-if [ ! -f "$PROJECT_ROOT/weights/orange_model_int8.onnx" ]; then
-    echo -e "${RED}[ERROR] Falta weights/orange_model_int8.onnx${NC}"
+if [ ! -f "$PROJECT_ROOT/weights/orange_model.onnx" ]; then
+    echo -e "${RED}[ERROR] Falta weights/orange_model.onnx${NC}"
     exit 1
 fi
 

@@ -125,10 +125,10 @@ def run_diagnostics():
     print(f"[3/4] Canal RAM (/dev/shm):      {shm_str}")
 
     # 4. Pesos del modelo
-    int8_model = PROJECT_ROOT / "weights" / "orange_model_int8.onnx"
-    exists_model = int8_model.exists()
-    size_mb = int8_model.stat().st_size / (1024 * 1024) if exists_model else 0
-    print(f"[4/4] Modelo INT8 desplegado:    {'DISPONIBLE' if exists_model else 'FALTANTE'} ({size_mb:.2f} MB)")
+    prod_model = PROJECT_ROOT / "weights" / "orange_model.onnx"
+    exists_model = prod_model.exists()
+    size_mb = prod_model.stat().st_size / (1024 * 1024) if exists_model else 0
+    print(f"[4/4] Modelo FP32 desplegado:    {'DISPONIBLE' if exists_model else 'FALTANTE'} ({size_mb:.2f} MB)")
     print("=" * 70)
 
     return {

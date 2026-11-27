@@ -292,14 +292,14 @@ def main():
         use_onnx = False
         model_file = Path(args.weights)
     else:
-        # Fallback a modelo ONNX INT8 o FP32
+        # Fallback a modelo ONNX FP32 (más preciso) o INT8
         int8_path = PROJECT_ROOT / "weights" / "orange_model_int8.onnx"
         fp32_path = PROJECT_ROOT / "weights" / "orange_model.onnx"
-        if int8_path.exists():
-            model_file = int8_path
-            use_onnx = True
-        elif fp32_path.exists():
+        if fp32_path.exists():
             model_file = fp32_path
+            use_onnx = True
+        elif int8_path.exists():
+            model_file = int8_path
             use_onnx = True
 
     predictor = QualityPredictor(

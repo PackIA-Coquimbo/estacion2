@@ -75,10 +75,11 @@ class QualityPredictor:
         if model_path is None:
             default_int8 = PROJECT_ROOT / "weights" / "orange_model_int8.onnx"
             default_fp32 = PROJECT_ROOT / "weights" / "orange_model.onnx"
-            if default_int8.exists():
-                model_path = default_int8
-            elif default_fp32.exists():
+            # FP32 primero: el INT8 cuantizado clasificó mal fruta con moho en pruebas reales
+            if default_fp32.exists():
                 model_path = default_fp32
+            elif default_int8.exists():
+                model_path = default_int8
             else:
                 raise FileNotFoundError(
                     "No se encontró un modelo ONNX por defecto en weights/. "

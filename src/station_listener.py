@@ -649,8 +649,8 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default=str(PROJECT_ROOT / "weights" / "orange_model_int8.onnx"),
-        help="Ruta al modelo ONNX (por defecto INT8 optimizado)",
+        default=str(PROJECT_ROOT / "weights" / "orange_model.onnx"),
+        help="Ruta al modelo ONNX (por defecto FP32; el INT8 es ~3x más rápido pero menos preciso)",
     )
     parser.add_argument(
         "--shm-dir",
@@ -709,10 +709,10 @@ def main():
     use_onnx = model_path.suffix.lower() != ".pth"
 
     if use_onnx and not model_path.exists():
-        fallback_fp32 = PROJECT_ROOT / "weights" / "orange_model.onnx"
+        fallback_int8 = PROJECT_ROOT / "weights" / "orange_model_int8.onnx"
         fallback_pth = PROJECT_ROOT / "weights" / "best_orange_model.pth"
-        if fallback_fp32.exists():
-            model_path = fallback_fp32
+        if fallback_int8.exists():
+            model_path = fallback_int8
         elif fallback_pth.exists():
             model_path = fallback_pth
             use_onnx = False

@@ -9,7 +9,7 @@ User=__USER__
 WorkingDirectory=__DIR__
 EnvironmentFile=-/etc/default/estacion2
 Environment=PYTHONUNBUFFERED=1
-ExecStart=__DIR__/.venv-pi/bin/python src/station_listener.py --model weights/orange_model_int8.onnx $E2_ARGS
+ExecStart=__DIR__/.venv-pi/bin/python src/station_listener.py --model weights/orange_model.onnx $E2_ARGS
 Restart=always
 RestartSec=3
 StandardOutput=journal
