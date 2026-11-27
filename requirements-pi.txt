@@ -1,6 +1,6 @@
 # Dependencias ultraligeras para inferencia en Raspberry Pi (Estación 2 - Edge)
-# Elimina PyTorch, torchvision y Pillow para despliegue embebido
-onnxruntime>=1.15.0
-numpy>=1.24.0,<2.0.0
+# Sin PyTorch: la inferencia usa el modelo ONNX (weights/orange_model_int8.onnx).
+# numpy sin tope <2.0: en Raspberry Pi OS Trixie (Python 3.13) solo hay wheels de numpy 2.x.
+onnxruntime>=1.19.0
+numpy>=1.24.0
 opencv-python-headless>=4.8.0
-

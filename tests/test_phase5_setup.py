@@ -37,12 +37,14 @@ def test_setup_script_structure():
     assert "EUID" in content or "root" in content, "Debe validar permisos de root/sudo."
 
     # Paquetes clave requeridos por FASES_OPTIMIZACION_PI.md
-    for pkg in ("python3-pip", "python3-numpy", "libgl1-mesa-glx", "cpufrequtils", "zram-tools"):
+    # (libgl1-mesa-glx y cpufrequtils no existen en Debian 13 / Raspberry Pi OS Trixie)
+    for pkg in ("python3-pip", "python3-numpy", "python3-venv", "libgl1"):
         assert pkg in content, f"Falta el paquete requerido: {pkg}"
 
-    # Governor de CPU
-    assert "cpufreq-set -g performance" in content, "Debe configurar cpufreq-set en performance."
-    assert "GOVERNOR=\"performance\"" in content or "GOVERNOR='performance'" in content, "Debe persistir el governor."
+    # Governor de CPU persistente mediante servicio systemd
+    assert "cpu-performance.service" in content, "Debe instalar el servicio de governor performance."
+    governor_unit = (PROJECT_ROOT / "scripts" / "cpu-performance.service").read_text(encoding="utf-8")
+    assert "performance" in governor_unit and "scaling_governor" in governor_unit
 
     # Desactivar swap en MicroSD
     assert "dphys-swapfile swapoff" in content, "Debe desactivar dphys-swapfile."

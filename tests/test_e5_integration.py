@@ -11,7 +11,7 @@ Verifica:
    y enviando `POST /api/v1/ingest/e2` a un servidor HTTP local simulado.
 """
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as HTTPServer
 from pathlib import Path
 import json
 import sys
@@ -216,6 +216,44 @@ class TestE5Integration(unittest.TestCase):
                 self.assertEqual(sent["id_lote"], "LOTE-2026-11-A")
                 self.assertEqual(sent["id_fruta"], "M-0001")
                 self.assertEqual(sent["datos"]["calidad_visual"], "alta")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_orange_two_photos_sends_e5_with_manifest(self):
+        try:
+            import numpy as np
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("OpenCV/NumPy no disponibles en este entorno")
+
+        from src.inference import DEFAULT_CLASSES, QualityPredictor
+        from src.station_listener import StationListener
+
+        predictor = QualityPredictor.__new__(QualityPredictor)
+        predictor.class_names = DEFAULT_CLASSES
+        predictor._infer_probs = lambda frame: (np.asarray([0.8, 0.15, 0.05], np.float32), 1.0, 2.0)
+
+        server = _start_mock_server()
+        try:
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            client = E5Client(base_url=base_url, timeout_sec=1.0, max_retries=1, backoff_base_sec=0.01)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                listener = StationListener(predictor=predictor, shm_dir=tmpdir, e5_client=client)
+                frame = np.zeros((48, 64, 3), dtype=np.uint8)
+                listener.communicator.send_orange_photos_from_station1(
+                    "7712323", 1, [frame, frame], id_lote="LOTE-2026-11-A", id_fruta="M-0001"
+                )
+                results = listener.process_pending_oranges()
+
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0]["id_fruta"], "M-0001")
+                self.assertEqual(results[0]["calidad_visual"], "alta")
+                self.assertTrue(results[0]["e5_sync"]["ok"])
+                self.assertEqual(list(listener.communicator.inbox_dir.iterdir()), [])
+                sent = json.loads(_MockE5Handler.received_bodies[0])
+                self.assertEqual(sent["id_lote"], "LOTE-2026-11-A")
+                self.assertEqual(sent["datos"]["confianza_visual"], 0.8)
         finally:
             server.shutdown()
             server.server_close()

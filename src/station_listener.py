@@ -11,7 +11,7 @@ Características de Fase 4:
 """
 
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, Union
+from typing import Dict, Any, Tuple, Optional, Union, List, Sequence
 import argparse
 import json
 import os
@@ -32,14 +32,26 @@ try:
 except ImportError:
     HAS_OPENCV = False
 
-from src.inference import QualityPredictor
+from src.inf_erence.predictor import QualityPredictor
+from src.inf_erence.oranges import (
+    EXPECTED_PHOTOS_PER_ORANGE,
+    build_orange_payload,
+    format_orange_photo_name,
+    group_photos_by_orange,
+    make_orange_id,
+)
 from src.e5_client import (
     DEFAULT_E5_BASE_URL,
+    E5AsyncSender,
     E5Client,
     build_e2_payload,
     map_prediction_to_e2_datos,
     utc_timestamp_iso,
 )
+
+# Tiempo máximo (s) que se espera la(s) foto(s) faltante(s) de una naranja antes de
+# calificarla con las fotos disponibles.
+DEFAULT_PHOTO_TIMEOUT_SEC = 2.0
 
 
 def get_default_shm_dir() -> Path:
@@ -74,6 +86,136 @@ class StationCommunicator:
         self.result_path = self.shm_dir / "estacion2_result.json"
         self.ack_path = self.shm_dir / "estacion_ack.flag"
 
+        # Canal multi-foto por naranja:
+        #   inbox/   <- Estación 1 deja <uid>-<naranja>.<foto>.jpg (escritura atómica .tmp + rename)
+        #   results/ <- Estación 2 deja <uid>-<naranja>.json con la calificación promediada
+        self.inbox_dir = self.shm_dir / "estacion2_inbox"
+        self.results_dir = self.shm_dir / "estacion2_results"
+        self.inbox_dir.mkdir(parents=True, exist_ok=True)
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Canal multi-foto por naranja
+    # ------------------------------------------------------------------
+    def send_orange_photos_from_station1(
+        self,
+        uid: str,
+        orange_number: int,
+        frames_bgr: Sequence[np.ndarray],
+        quality: int = 95,
+        id_lote: Optional[str] = None,
+        id_fruta: Optional[str] = None,
+    ) -> List[Path]:
+        """
+        Usado por la Estación 1 (o simulador): deja las fotos de una naranja en la bandeja
+        como <uid>-<naranja>.<n_foto>.jpg. Cada archivo se escribe primero como .tmp y luego
+        se renombra, por lo que la Estación 2 nunca lee una imagen a medio escribir.
+        """
+        if not HAS_OPENCV:
+            raise RuntimeError("OpenCV no está disponible para codificar la imagen.")
+
+        written: List[Path] = []
+        # El manifiesto (id_lote/id_fruta para E5) se escribe ANTES que las fotos
+        if id_lote is not None or id_fruta is not None:
+            self.write_orange_manifest(uid, orange_number, id_lote, id_fruta)
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        for photo_number, frame in enumerate(frames_bgr, start=1):
+            success, encoded_img = cv2.imencode(".jpg", frame, encode_param)
+            if not success:
+                raise RuntimeError("Fallo al codificar frame BGR a formato JPEG.")
+            final_path = self.inbox_dir / format_orange_photo_name(uid, orange_number, photo_number)
+            tmp_path = final_path.with_name(final_path.name + ".tmp")
+            with open(tmp_path, "wb") as f:
+                f.write(encoded_img.tobytes())
+            tmp_path.replace(final_path)
+            written.append(final_path)
+        return written
+
+    def orange_manifest_path(self, uid: str, orange_number: int) -> Path:
+        """Manifiesto opcional de E1 por naranja: inbox/<uid>-<naranja>.json"""
+        return self.inbox_dir / f"{make_orange_id(uid, orange_number)}.json"
+
+    def write_orange_manifest(
+        self, uid: str, orange_number: int, id_lote: Optional[str], id_fruta: Optional[str]
+    ) -> Path:
+        path = self.orange_manifest_path(uid, orange_number)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"id_lote": id_lote, "id_fruta": id_fruta}, f)
+        tmp.replace(path)
+        return path
+
+    def read_orange_manifest(self, uid: str, orange_number: int) -> Dict[str, Optional[str]]:
+        path = self.orange_manifest_path(uid, orange_number)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {"id_lote": data.get("id_lote"), "id_fruta": data.get("id_fruta")}
+        except (OSError, json.JSONDecodeError):
+            pass
+        return {"id_lote": None, "id_fruta": None}
+
+    def list_pending_oranges(self) -> Dict[Tuple[str, int], List[Path]]:
+        """Agrupa por naranja las fotos terminadas en la bandeja (ignora archivos .tmp u otros)."""
+        files = [p for p in self.inbox_dir.iterdir() if p.is_file()]
+        groups, _ = group_photos_by_orange(files)
+        return groups
+
+    def read_photos(self, paths: Sequence[Path]) -> Tuple[List[np.ndarray], List[str], float]:
+        """Lee y decodifica fotos desde RAM. Retorna (frames, nombres, latencia_ms) de las legibles."""
+        t0 = time.perf_counter()
+        frames: List[np.ndarray] = []
+        names: List[str] = []
+        for path in paths:
+            try:
+                buf = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            frame = cv2.imdecode(np.frombuffer(buf, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is not None:
+                frames.append(frame)
+                names.append(path.name)
+        return frames, names, (time.perf_counter() - t0) * 1000.0
+
+    def remove_photos(self, paths: Sequence[Path]) -> None:
+        for path in paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def write_orange_result(self, payload: Dict[str, Any]) -> Path:
+        """Escribe de forma atómica el resultado de una naranja en results/<orange_id>.json."""
+        result_path = self.results_dir / f"{payload['orange_id']}.json"
+        tmp_path = result_path.with_name(result_path.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        tmp_path.replace(result_path)
+        return result_path
+
+    def wait_for_orange_result_in_station1(
+        self,
+        orange_id: str,
+        timeout_sec: float = 5.0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Usado por la Estación 1: espera el resultado de la naranja <uid>-<n>, lo retorna
+        y lo elimina de la carpeta de resultados. Retorna None si se agota el tiempo.
+        """
+        result_path = self.results_dir / f"{orange_id}.json"
+        t_expire = time.time() + timeout_sec
+        while time.time() < t_expire:
+            if result_path.exists():
+                try:
+                    with open(result_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    result_path.unlink()
+                    return data
+                except (json.JSONDecodeError, PermissionError, FileNotFoundError):
+                    pass
+            time.sleep(0.001)
+        return None
+
     def send_frame_from_station1(
         self,
         frame_bgr: np.ndarray,
@@ -83,7 +225,6 @@ class StationCommunicator:
     ) -> float:
         """
         Método utilizado por la Estación 1 (o simulador) para enviar un frame a la Estación 2 vía RAM.
-        Opcionalmente recibe id_lote e id_fruta del manifiesto de E1.
         Retorna el tiempo de escritura en RAM en milisegundos.
         """
         if not HAS_OPENCV:
@@ -97,9 +238,8 @@ class StationCommunicator:
 
         # Escribir o limpiar manifiesto de E1 en RAM
         if id_lote is not None or id_fruta is not None:
-            manifest_data = {"id_lote": id_lote, "id_fruta": id_fruta}
             with open(self.manifest_path, "w", encoding="utf-8") as f:
-                json.dump(manifest_data, f)
+                json.dump({"id_lote": id_lote, "id_fruta": id_fruta}, f)
         elif self.manifest_path.exists():
             self.manifest_path.unlink()
 
@@ -144,22 +284,15 @@ class StationCommunicator:
         return True, frame_bgr, read_latency_ms
 
     def read_manifest_in_station2(self) -> Dict[str, Optional[str]]:
-        """
-        Lee los identificadores (id_lote, id_fruta) del manifiesto enviado por E1 en RAM.
-        Acepta tanto `estacion_manifest.json` como un JSON embebido en `estacion_trigger.flag`.
-        """
+        """Lee id_lote/id_fruta del manifiesto E1 (o de un JSON embebido en el trigger)."""
         for candidate in (self.manifest_path, self.trigger_path):
             if candidate.exists():
                 try:
-                    with open(candidate, "r", encoding="utf-8") as f:
-                        raw = f.read().strip()
+                    raw = candidate.read_text(encoding="utf-8").strip()
                     if raw.startswith("{"):
                         data = json.loads(raw)
                         if isinstance(data, dict):
-                            return {
-                                "id_lote": data.get("id_lote"),
-                                "id_fruta": data.get("id_fruta"),
-                            }
+                            return {"id_lote": data.get("id_lote"), "id_fruta": data.get("id_fruta")}
                 except (json.JSONDecodeError, OSError):
                     pass
         return {"id_lote": None, "id_fruta": None}
@@ -195,7 +328,11 @@ class StationCommunicator:
 
     def cleanup(self) -> None:
         """Limpia los archivos temporales creados en /dev/shm."""
-        for p in (self.frame_path, self.trigger_path, self.manifest_path, self.result_path, self.ack_path):
+        paths = [self.frame_path, self.trigger_path, self.manifest_path, self.result_path, self.ack_path]
+        for folder in (self.inbox_dir, self.results_dir):
+            if folder.exists():
+                paths.extend(p for p in folder.iterdir() if p.is_file())
+        for p in paths:
             if p.exists():
                 try:
                     p.unlink()
@@ -207,22 +344,132 @@ class StationListener:
     """
     Servicio de escucha de eventos (Listener) de la Estación 2.
     Espera señales de la Estación 1, lee la imagen en RAM (/dev/shm),
-    ejecuta la predicción de calidad visual, entrega el resultado en RAM
-    y, cuando hay manifiesto E1 y cliente E5 activo, envía POST /api/v1/ingest/e2.
+    ejecuta la predicción de calidad visual y entrega el resultado estandarizado.
     """
     def __init__(
         self,
         predictor: QualityPredictor,
         shm_dir: Optional[Union[str, Path]] = None,
         poll_interval_sec: float = 0.002,
+        expected_photos: int = EXPECTED_PHOTOS_PER_ORANGE,
+        photo_timeout_sec: float = DEFAULT_PHOTO_TIMEOUT_SEC,
         e5_client: Optional[E5Client] = None,
+        e5_async: bool = False,
     ):
         self.predictor = predictor
+        self.e5_client = e5_client if (e5_client is not None and e5_client.enabled) else None
+        self.e5_sender = E5AsyncSender(self.e5_client) if (self.e5_client and e5_async) else None
         self.communicator = StationCommunicator(shm_dir=shm_dir)
         self.poll_interval = poll_interval_sec
-        self.e5_client = e5_client
+        self.expected_photos = expected_photos
+        self.photo_timeout_sec = photo_timeout_sec
         self.running = False
         self.processed_count = 0
+        # Momento en que el servicio vio por primera vez cada naranja en la bandeja.
+        # No se usa la fecha de modificación de los archivos: una copia (Copy-Item,
+        # scp -p, rsync -a) conserva la fecha original y la naranja parecería vencida.
+        self._first_seen: Dict[Tuple[str, int], float] = {}
+
+    def _send_to_e5(self, payload: Dict[str, Any], id_lote, id_fruta, predicted_class, confidence) -> None:
+        """Arma el mensaje v3 y lo envía a E5 (en segundo plano si e5_async=True)."""
+        if self.e5_client is None:
+            return
+        if not id_lote or not id_fruta:
+            print("[E5 WARN] Sin id_lote/id_fruta; se omite POST /api/v1/ingest/e2.", flush=True)
+            return
+        e5_payload = build_e2_payload(
+            id_lote=id_lote,
+            id_fruta=id_fruta,
+            predicted_class=predicted_class,
+            confidence=confidence,
+            timestamp=payload.get("timestamp_iso"),
+        )
+        if self.e5_sender is not None:
+            self.e5_sender.submit(e5_payload)
+            payload["e5_sync"] = {"queued": True}
+        else:
+            res = self.e5_client.send_e2_ingest(e5_payload)
+            payload["e5_sync"] = res
+            if not res.get("ok"):
+                print(
+                    f"[E5 WARN] Fallo al enviar fruta={id_fruta} lote={id_lote}: "
+                    f"status={res.get('status_code')} error={res.get('error')}",
+                    flush=True,
+                )
+
+    def process_pending_oranges(self) -> List[Dict[str, Any]]:
+        """
+        Califica las naranjas listas en la bandeja de fotos:
+        - Completa: llegaron `expected_photos` fotos legibles -> se procesa de inmediato.
+        - Incompleta: si pasaron `photo_timeout_sec` desde que el servicio vio la naranja
+          por primera vez, se califica con las fotos disponibles (campo "complete": false).
+          Si ninguna es legible, se entrega un resultado con "error" para que la
+          Estación 1 no quede esperando.
+        Las fotos procesadas se eliminan de la bandeja.
+        """
+        results: List[Dict[str, Any]] = []
+        now = time.time()
+        pending = self.communicator.list_pending_oranges()
+
+        # Olvidar naranjas que ya no están en la bandeja (procesadas o retiradas)
+        for key in list(self._first_seen):
+            if key not in pending:
+                del self._first_seen[key]
+
+        for (uid, orange_number), paths in pending.items():
+            first_seen = self._first_seen.setdefault((uid, orange_number), now)
+            timed_out = (now - first_seen) >= self.photo_timeout_sec
+            if len(paths) < self.expected_photos and not timed_out:
+                continue
+
+            t_cycle_start = time.perf_counter()
+            frames, names, read_latency_ms = self.communicator.read_photos(paths)
+            if len(frames) < len(paths) and not timed_out:
+                continue  # Alguna foto aún no es legible; reintentar en el próximo ciclo
+
+            if not frames:
+                payload: Dict[str, Any] = {
+                    "station_id": 2,
+                    "timestamp": round(time.time(), 3),
+                    "uid": uid,
+                    "orange_number": orange_number,
+                    "orange_id": make_orange_id(uid, orange_number),
+                    "error": "Ninguna foto de la naranja pudo decodificarse.",
+                    "photos_count": 0,
+                    "expected_photos": self.expected_photos,
+                    "complete": False,
+                }
+            else:
+                orange_res = self.predictor.predict_orange(frames, photo_names=names)
+                payload = build_orange_payload(uid, orange_number, orange_res, self.expected_photos)
+                payload["latency_read_shm_ms"] = round(read_latency_ms, 2)
+                payload["latency_total_ms"] = round((time.perf_counter() - t_cycle_start) * 1000.0, 2)
+
+                # Campos del contrato v3 de E5
+                e2_datos = map_prediction_to_e2_datos(
+                    predicted_class=orange_res["predicted_class"],
+                    confidence=orange_res["confidence"],
+                )
+                payload.update(e2_datos)
+                payload["timestamp_iso"] = utc_timestamp_iso()
+                # id_lote/id_fruta: manifiesto <uid>-<n>.json de E1; si no hay, se usa uid y orange_id
+                manifest = self.communicator.read_orange_manifest(uid, orange_number)
+                payload["id_lote"] = manifest["id_lote"] or uid
+                payload["id_fruta"] = manifest["id_fruta"] or payload["orange_id"]
+
+            self.communicator.write_orange_result(payload)
+            self.communicator.remove_photos(paths)
+            self.communicator.remove_photos([self.communicator.orange_manifest_path(uid, orange_number)])
+            if "error" not in payload:
+                self._send_to_e5(
+                    payload, payload["id_lote"], payload["id_fruta"],
+                    orange_res["predicted_class"], orange_res["confidence"],
+                )
+            self._first_seen.pop((uid, orange_number), None)
+            self.processed_count += 1
+            results.append(payload)
+
+        return results
 
     def process_pending_event(self) -> Optional[Dict[str, Any]]:
         """Procesa un evento pendiente si el archivo trigger existe."""
@@ -230,11 +477,7 @@ class StationListener:
             return None
 
         t_cycle_start = time.perf_counter()
-
-        # 0. Leer manifiesto E1 (id_lote, id_fruta) antes de consumir el trigger
         manifest = self.communicator.read_manifest_in_station2()
-        id_lote = manifest.get("id_lote")
-        id_fruta = manifest.get("id_fruta")
 
         # 1. Leer frame directamente de memoria RAM (/dev/shm)
         success, frame_bgr, read_latency_ms = self.communicator.read_frame_in_station2()
@@ -247,62 +490,34 @@ class StationListener:
         t_cycle_end = time.perf_counter()
         total_transfer_infer_ms = (t_cycle_end - t_cycle_start) * 1000.0
 
-        # 3. Mapear resultado al contrato v3 de E5
-        e2_datos = map_prediction_to_e2_datos(
-            predicted_class=pred_res["predicted_class"],
-            confidence=pred_res["confidence"],
-        )
-        iso_ts = utc_timestamp_iso()
-
-        # Construir estructura JSON en RAM (compatible con Fase 4 + campos v3)
-        result_payload: Dict[str, Any] = {
+        # 3. Construir estructura JSON estandarizada según especificación de Fase 4
+        result_payload = {
             "station_id": 2,
-            "estacion": "E2",
             "timestamp": round(time.time(), 3),
-            "timestamp_iso": iso_ts,
             "predicted_class": pred_res["predicted_class"],
             "confidence_percent": pred_res["confidence_percent"],
-            "calidad_visual": e2_datos["calidad_visual"],
-            "confianza_visual": e2_datos["confianza_visual"],
-            "defectos_detectados": e2_datos["defectos_detectados"],
             "probabilities": pred_res["probabilities"],
             "latency_read_shm_ms": round(read_latency_ms, 2),
             "latency_preprocess_ms": pred_res["latency_preprocess_ms"],
             "latency_inference_ms": pred_res["latency_inference_ms"],
             "latency_total_ms": round(total_transfer_infer_ms, 2),
+            "timestamp_iso": utc_timestamp_iso(),
         }
-        if id_lote is not None:
-            result_payload["id_lote"] = id_lote
-        if id_fruta is not None:
-            result_payload["id_fruta"] = id_fruta
+        result_payload.update(map_prediction_to_e2_datos(
+            predicted_class=pred_res["predicted_class"], confidence=pred_res["confidence"],
+        ))
+        if manifest["id_lote"]:
+            result_payload["id_lote"] = manifest["id_lote"]
+        if manifest["id_fruta"]:
+            result_payload["id_fruta"] = manifest["id_fruta"]
 
         # 4. Escribir resultado en /dev/shm y emitir ACK
         self.communicator.write_result_from_station2(result_payload)
         self.processed_count += 1
-
-        # 5. Enviar lectura v3 a Estación 5 (POST /api/v1/ingest/e2)
-        if self.e5_client is not None and self.e5_client.enabled:
-            if id_lote and id_fruta:
-                e5_payload = build_e2_payload(
-                    id_lote=id_lote,
-                    id_fruta=id_fruta,
-                    predicted_class=pred_res["predicted_class"],
-                    confidence=pred_res["confidence"],
-                    defects=e2_datos["defectos_detectados"],
-                    timestamp=iso_ts,
-                )
-                e5_sync = self.e5_client.send_e2_ingest(e5_payload)
-                result_payload["e5_sync"] = e5_sync
-                if not e5_sync.get("ok"):
-                    print(
-                        f"[E5 WARN] Fallo al enviar fruta={id_fruta} lote={id_lote} a E5: "
-                        f"status={e5_sync.get('status_code')} error={e5_sync.get('error')}"
-                    )
-            else:
-                print(
-                    "[E5 WARN] Manifiesto E1 sin id_lote/id_fruta; "
-                    "se omite el envío HTTP a POST /api/v1/ingest/e2."
-                )
+        self._send_to_e5(
+            result_payload, manifest["id_lote"], manifest["id_fruta"],
+            pred_res["predicted_class"], pred_res["confidence"],
+        )
 
         return result_payload
 
@@ -312,13 +527,20 @@ class StationListener:
         print("=" * 70)
         print("ESTACIÓN 2: SERVICIO DE ESCUCHA INTER-ESTACIONES (RAM /dev/shm)")
         print(f"Canal de memoria compartida: {self.communicator.shm_dir}")
+        print(f"Bandeja de fotos por naranja:  {self.communicator.inbox_dir} "
+              f"({self.expected_photos} fotos/naranja, espera máx. {self.photo_timeout_sec:.1f}s)")
+        print(f"Resultados por naranja:        {self.communicator.results_dir}")
+        print(f"Envío a E5:                    {self.e5_client.ingest_url if self.e5_client else 'DESACTIVADO'}")
         print("Estado: Esperando señales de captura desde Estación 1...")
         print("=" * 70)
 
         try:
             while self.running:
+                handled = False
+
                 result = self.process_pending_event()
                 if result is not None:
+                    handled = True
                     print(
                         f"[EVENTO #{self.processed_count:04d}] "
                         f"Calidad: {result['predicted_class'].upper():<20} ({result['confidence_percent']:5.1f}%) | "
@@ -326,15 +548,33 @@ class StationListener:
                         f"Inf: {result['latency_inference_ms']:.2f}ms | "
                         f"Total: {result['latency_total_ms']:.2f}ms"
                     )
-                    if max_events is not None and self.processed_count >= max_events:
-                        print(f"[INFO] Límite de {max_events} eventos procesados alcanzado.")
-                        break
-                else:
+
+                for orange in self.process_pending_oranges():
+                    handled = True
+                    if "error" in orange:
+                        print(f"[NARANJA {orange['orange_id']}] ERROR: {orange['error']}")
+                        continue
+                    print(
+                        f"[NARANJA {orange['orange_id']}] "
+                        f"Calidad promedio: {orange['predicted_class'].upper():<20} "
+                        f"({orange['confidence_percent']:5.1f}%) | "
+                        f"Fotos: {orange['photos_count']}/{orange['expected_photos']}"
+                        f"{'' if orange['photos_agree'] else ' (no coinciden)'} | "
+                        f"Total: {orange['latency_total_ms']:.2f}ms",
+                        flush=True,
+                    )
+
+                if max_events is not None and self.processed_count >= max_events:
+                    print(f"[INFO] Límite de {max_events} eventos procesados alcanzado.")
+                    break
+                if not handled:
                     time.sleep(self.poll_interval)
         except KeyboardInterrupt:
             print("\n[INFO] Detención del servicio solicitada por el usuario.")
         finally:
             self.running = False
+            if self.e5_sender is not None:
+                self.e5_sender.flush(timeout_sec=10.0)
             print(f"[INFO] Servicio finalizado. Total de frutas analizadas: {self.processed_count}")
 
 
@@ -435,28 +675,26 @@ def main():
         help="Hilos de inferencia para ONNX Runtime",
     )
     parser.add_argument(
+        "--expected-photos",
+        type=int,
+        default=EXPECTED_PHOTOS_PER_ORANGE,
+        help="Fotos esperadas por naranja antes de calificarla (por defecto 2)",
+    )
+    parser.add_argument(
+        "--photo-timeout",
+        type=float,
+        default=DEFAULT_PHOTO_TIMEOUT_SEC,
+        help="Segundos a esperar fotos faltantes antes de calificar con las disponibles",
+    )
+    parser.add_argument(
         "--e5-url",
         type=str,
         default=os.environ.get("E5_API_URL", DEFAULT_E5_BASE_URL),
-        help="URL base de la API de Estación 5 (por defecto http://192.168.0.10:8000)",
+        help="URL base de la API de Estación 5 (por defecto $E5_API_URL o http://192.168.0.10:8000)",
     )
-    parser.add_argument(
-        "--no-e5",
-        action="store_true",
-        help="Desactiva el envío HTTP hacia Estación 5 (solo memoria compartida local)",
-    )
-    parser.add_argument(
-        "--e5-timeout",
-        type=float,
-        default=3.0,
-        help="Timeout HTTP en segundos para POST /api/v1/ingest/e2",
-    )
-    parser.add_argument(
-        "--e5-retries",
-        type=int,
-        default=3,
-        help="Cantidad de reintentos ante timeout/error de red hacia E5",
-    )
+    parser.add_argument("--no-e5", action="store_true", help="No enviar resultados a Estación 5")
+    parser.add_argument("--e5-timeout", type=float, default=3.0, help="Timeout HTTP hacia E5 (s)")
+    parser.add_argument("--e5-retries", type=int, default=3, help="Reintentos ante error de red hacia E5")
     args = parser.parse_args()
 
     if args.benchmark:
@@ -485,17 +723,18 @@ def main():
         num_threads=args.threads,
     )
 
-    e5_client = E5Client(
-        base_url=args.e5_url,
-        timeout_sec=args.e5_timeout,
-        max_retries=args.e5_retries,
-        enabled=not args.no_e5,
-    )
-
     listener = StationListener(
         predictor=predictor,
         shm_dir=args.shm_dir,
-        e5_client=e5_client,
+        expected_photos=args.expected_photos,
+        photo_timeout_sec=args.photo_timeout,
+        e5_client=E5Client(
+            base_url=args.e5_url,
+            timeout_sec=args.e5_timeout,
+            max_retries=args.e5_retries,
+            enabled=not args.no_e5,
+        ),
+        e5_async=True,
     )
 
     max_events = 1 if args.once else None

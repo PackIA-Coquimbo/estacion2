@@ -189,3 +189,53 @@ class E5Client:
             "attempts": attempts,
         }
 
+
+class E5AsyncSender:
+    """
+    Envía las lecturas a E5 en un hilo de fondo para que una caída o lentitud de la red
+    nunca frene la calificación de naranjas en la cinta. Cada mensaje conserva su JSON
+    original (mismo timestamp) en todos los reintentos.
+    """
+
+    def __init__(self, client: "E5Client", max_queue: int = 1000):
+        import queue
+        import threading
+
+        self.client = client
+        self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max_queue)
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="E5AsyncSender")
+        self._thread.start()
+
+    def submit(self, payload: Dict[str, Any]) -> bool:
+        """Encola un payload. Retorna False si la cola está llena (E5 caído por mucho tiempo)."""
+        try:
+            self._queue.put_nowait(payload)
+            return True
+        except Exception:
+            print(f"[E5 WARN] Cola llena; se descarta fruta={payload.get('id_fruta')}", flush=True)
+            return False
+
+    def _worker(self) -> None:
+        while True:
+            payload = self._queue.get()
+            res = self.client.send_e2_ingest(payload)
+            if res.get("ok"):
+                dup = (res.get("response") or {}).get("duplicado")
+                print(
+                    f"[E5 OK] fruta={payload['id_fruta']} lote={payload['id_lote']} "
+                    f"status={res.get('status_code')}{' (duplicado)' if dup else ''}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[E5 WARN] Fallo al enviar fruta={payload.get('id_fruta')} lote={payload.get('id_lote')}: "
+                    f"status={res.get('status_code')} error={res.get('error')}",
+                    flush=True,
+                )
+            self._queue.task_done()
+
+    def flush(self, timeout_sec: float = 10.0) -> None:
+        """Espera (con límite) a que se vacíe la cola; útil al apagar el servicio."""
+        t_end = time.time() + timeout_sec
+        while self._queue.unfinished_tasks and time.time() < t_end:
+            time.sleep(0.05)
