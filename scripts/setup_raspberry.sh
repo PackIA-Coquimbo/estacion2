@@ -25,6 +25,17 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_USER="${SUDO_USER:-$(stat -c '%U' "$PROJECT_ROOT")}"
 VENV_DIR="$PROJECT_ROOT/.venv-pi"
 
+if [ "$APP_USER" = "root" ]; then
+    echo -e "${RED}[ERROR] Ejecuta con sudo desde tu usuario normal (no como root directo).${NC}"
+    exit 1
+fi
+
+# onnxruntime solo publica wheels para ARM de 64 bits
+if [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "x86_64" ]; then
+    echo -e "${RED}[ERROR] Arquitectura $(uname -m) no soportada: instala Raspberry Pi OS de 64 bits (Pi 3B+/4/5).${NC}"
+    exit 1
+fi
+
 echo -e "${BLUE}== Estación 2: instalación en $PROJECT_ROOT (usuario: $APP_USER) ==${NC}"
 
 # ---------------------------------------------------------------- 1. Paquetes
@@ -78,9 +89,12 @@ else
     echo "  /etc/default/estacion2 ya existe; no se sobrescribe."
 fi
 systemctl daemon-reload
+usermod -aG video "$APP_USER" || true
 systemctl enable estacion2.service
+systemctl restart estacion2.service
 
-echo -e "\n${BLUE}== Instalación completa ==${NC}"
-echo -e "Iniciar:     ${YELLOW}sudo systemctl start estacion2${NC}"
+echo -e "\n${BLUE}== Instalación completa: servicio en ejecución ==${NC}"
+echo -e "Estado:      ${YELLOW}systemctl status estacion2${NC}"
+echo -e "Config:      ${YELLOW}sudo nano /etc/default/estacion2${NC} y luego ${YELLOW}sudo systemctl restart estacion2${NC}"
 echo -e "Ver logs:    ${YELLOW}journalctl -u estacion2 -f${NC}"
 echo -e "Bandeja E1:  ${YELLOW}/dev/shm/estacion2_inbox/${NC}   Resultados: ${YELLOW}/dev/shm/estacion2_results/${NC}"
