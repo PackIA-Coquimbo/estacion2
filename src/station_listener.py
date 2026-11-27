@@ -704,16 +704,22 @@ def main():
         )
         return
 
-    # Inicializar predictor de calidad optimizado
+    # Inicializar predictor de calidad optimizado (ONNX por defecto, fallback a .pth si existe)
     model_path = Path(args.model)
-    if not model_path.exists():
+    use_onnx = model_path.suffix.lower() != ".pth"
+
+    if use_onnx and not model_path.exists():
         fallback_fp32 = PROJECT_ROOT / "weights" / "orange_model.onnx"
+        fallback_pth = PROJECT_ROOT / "weights" / "best_orange_model.pth"
         if fallback_fp32.exists():
             model_path = fallback_fp32
+        elif fallback_pth.exists():
+            model_path = fallback_pth
+            use_onnx = False
 
     predictor = QualityPredictor(
         model_path=model_path,
-        use_onnx=True,
+        use_onnx=use_onnx,
         num_threads=args.threads,
     )
 

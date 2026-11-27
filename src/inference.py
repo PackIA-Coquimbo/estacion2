@@ -57,6 +57,12 @@ from src.inf_erence.oranges import (
     group_photos_by_orange,
     parse_orange_photo_name,
 )
+from src.e5_client import (
+    DEFAULT_E5_BASE_URL,
+    E5Client,
+    build_e2_payload,
+    map_prediction_to_e2_datos,
+)
 
 __all__ = [
     "DEFAULT_CLASSES", "CLASS_COLORS_BGR",
@@ -261,6 +267,10 @@ def main():
     parser.add_argument("--export-onnx", type=str, default=None, help="Exportar modelo PyTorch a ONNX")
     parser.add_argument("--threads", type=int, default=4, help="Número de hilos de inferencia (por defecto 4)")
     parser.add_argument("--benchmark", action="store_true", help="Ejecuta benchmark de preprocesamiento Zero-Copy")
+    parser.add_argument("--lote", type=str, default=None, help="ID de lote E1 para formato v3 de E5 (ej. LOTE-2026-11-A)")
+    parser.add_argument("--fruta", type=str, default=None, help="ID de fruta E1 para formato v3 de E5 (ej. M-0001)")
+    parser.add_argument("--e5-url", type=str, default=DEFAULT_E5_BASE_URL, help="URL base de la API de E5")
+    parser.add_argument("--send-e5", action="store_true", help="Envía la lectura a POST /api/v1/ingest/e2 (requiere --lote y --fruta)")
     args = parser.parse_args()
 
     if args.benchmark:
@@ -320,6 +330,22 @@ def main():
                 "'python -m pip install opencv-python' y vuelve a ejecutar."
             )
         results = classify_oranges(predictor, image_paths, expected_photos=args.expected_photos)
+        for res in results:
+            conf = res["confidence_percent"] / 100.0
+            res.update(map_prediction_to_e2_datos(predicted_class=res["predicted_class"], confidence=conf))
+            # Con una sola naranja, --lote/--fruta definen los IDs de E5; si no, se usan uid y orange_id
+            res["id_lote"] = args.lote or res["uid"]
+            res["id_fruta"] = args.fruta if (args.fruta and len(results) == 1) else res["orange_id"]
+            if args.send_e5:
+                e5_payload = build_e2_payload(
+                    id_lote=res["id_lote"],
+                    id_fruta=res["id_fruta"],
+                    predicted_class=res["predicted_class"],
+                    confidence=conf,
+                )
+                res["e5_sync"] = E5Client(base_url=args.e5_url).send_e2_ingest(e5_payload)
+                if not args.json:
+                    print(f"[E5] {res['id_fruta']}: {res['e5_sync']}")
         if args.json:
             print(json.dumps(results, indent=2))
         elif results:
@@ -346,18 +372,53 @@ def main():
             return
 
         res, _ = predictor.predict_cv2(frame)
+        e2_datos = map_prediction_to_e2_datos(
+            predicted_class=res["predicted_class"],
+            confidence=res["confidence"],
+        )
+
+        if args.send_e5:
+            if not args.lote or not args.fruta:
+                print("Error: --send-e5 requiere especificar --lote y --fruta.")
+                return
+            e5_payload = build_e2_payload(
+                id_lote=args.lote,
+                id_fruta=args.fruta,
+                predicted_class=res["predicted_class"],
+                confidence=res["confidence"],
+                defects=e2_datos["defectos_detectados"],
+            )
+            e5_res = E5Client(base_url=args.e5_url).send_e2_ingest(e5_payload)
+            if args.json:
+                print(json.dumps({"payload": e5_payload, "e5_response": e5_res}, indent=2))
+                return
+            print(f"[E5] Respuesta POST /api/v1/ingest/e2: {e5_res}")
+
         if args.json:
-            payload = {
-                "station_id": 2,
-                "timestamp": round(time.time(), 3),
-                "image_name": image_path.name,
-                "predicted_class": res["predicted_class"],
-                "confidence_percent": res["confidence_percent"],
-                "probabilities": res["probabilities"],
-                "latency_preprocess_ms": res["latency_preprocess_ms"],
-                "latency_inference_ms": res["latency_inference_ms"],
-                "latency_total_ms": res["latency_ms"],
-            }
+            if args.lote and args.fruta:
+                payload = build_e2_payload(
+                    id_lote=args.lote,
+                    id_fruta=args.fruta,
+                    predicted_class=res["predicted_class"],
+                    confidence=res["confidence"],
+                    defects=e2_datos["defectos_detectados"],
+                )
+            else:
+                payload = {
+                    "station_id": 2,
+                    "estacion": "E2",
+                    "timestamp": round(time.time(), 3),
+                    "image_name": image_path.name,
+                    "predicted_class": res["predicted_class"],
+                    "confidence_percent": res["confidence_percent"],
+                    "calidad_visual": e2_datos["calidad_visual"],
+                    "confianza_visual": e2_datos["confianza_visual"],
+                    "defectos_detectados": e2_datos["defectos_detectados"],
+                    "probabilities": res["probabilities"],
+                    "latency_preprocess_ms": res["latency_preprocess_ms"],
+                    "latency_inference_ms": res["latency_inference_ms"],
+                    "latency_total_ms": res["latency_ms"],
+                }
             print(json.dumps(payload, indent=2))
             return
 
